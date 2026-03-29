@@ -1,0 +1,814 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Survivor Arena</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; height: 100%; overflow: hidden; background: #0a0a1a; }
+canvas { display: block; }
+#game-container { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; }
+</style>
+</head>
+<body>
+<div id="game-container"></div>
+<script src="https://cdn.jsdelivr.net/npm/pixi.js@8.6.6/dist/pixi.min.js"></script>
+<script>
+(async function() {
+'use strict';
+
+// ── Constants ──
+const WORLD_W = 3000, WORLD_H = 3000;
+const PLAYER_SPEED = 200;
+const PLAYER_MAX_HP = 100;
+const PLAYER_RADIUS = 14;
+const PROJECTILE_SPEED = 400;
+const PROJECTILE_DAMAGE = 20;
+const PROJECTILE_LIFETIME = 1.2;
+const WEAPON_COOLDOWN = 0.45;
+const ENEMY_BASE_HP = 30;
+const ENEMY_BASE_SPEED = 60;
+const ENEMY_DAMAGE = 8;
+const ENEMY_DAMAGE_COOLDOWN = 0.5;
+const XP_MAGNET_RANGE = 80;
+const XP_COLLECT_RANGE = 18;
+const XP_MAGNET_SPEED = 350;
+const GAME_DURATION = 180; // 3 minutes
+const POOL_MAX = 500;
+const SPAWN_RING_MIN = 450;
+const SPAWN_RING_MAX = 600;
+
+// ── XP curve ──
+function xpForLevel(lvl) { return 10 + lvl * 8; }
+
+// ── Object Pools ──
+class Pool {
+  constructor(factory, reset, max = POOL_MAX) {
+    this._factory = factory; this._reset = reset; this._max = max;
+    this._pool = []; this.active = [];
+  }
+  get() {
+    const obj = this._pool.length > 0 ? this._pool.pop() : this._factory();
+    this._reset(obj);
+    this.active.push(obj);
+    return obj;
+  }
+  release(obj) {
+    const idx = this.active.indexOf(obj);
+    if (idx !== -1) { this.active.splice(idx, 1); this._pool.length < this._max && this._pool.push(obj); }
+    if (obj.parent) obj.parent.removeChild(obj);
+  }
+  releaseAll() { while (this.active.length) this.release(this.active[0]); }
+}
+
+// ── Init Pixi ──
+const app = new PIXI.Application();
+await app.init({
+  resizeTo: window,
+  backgroundColor: 0x111122,
+  antialias: false,
+  resolution: Math.min(window.devicePixelRatio || 1, 2),
+  autoDensity: true,
+});
+document.getElementById('game-container').appendChild(app.canvas);
+
+// ── Layers ──
+const worldContainer = new PIXI.Container();
+const bgContainer = new PIXI.Container();
+const entityContainer = new PIXI.Container();
+const particleContainer = new PIXI.Container();
+const hudContainer = new PIXI.Container();
+const uiContainer = new PIXI.Container();
+worldContainer.addChild(bgContainer, entityContainer, particleContainer);
+app.stage.addChild(worldContainer, hudContainer, uiContainer);
+
+// ── Draw background grid ──
+function drawBackground() {
+  const g = new PIXI.Graphics();
+  g.rect(0, 0, WORLD_W, WORLD_H).fill(0x111122);
+  const gridSize = 80;
+  for (let x = 0; x <= WORLD_W; x += gridSize) {
+    g.moveTo(x, 0).lineTo(x, WORLD_H).stroke({ color: 0x1a1a33, width: 1 });
+  }
+  for (let y = 0; y <= WORLD_H; y += gridSize) {
+    g.moveTo(0, y).lineTo(WORLD_W, y).stroke({ color: 0x1a1a33, width: 1 });
+  }
+  // Arena boundary
+  g.rect(0, 0, WORLD_W, WORLD_H).stroke({ color: 0x334466, width: 3 });
+  bgContainer.addChild(g);
+}
+drawBackground();
+
+// ── Game State ──
+const state = {
+  phase: 'title', // title, playing, levelup, gameover
+  timer: 0,
+  screenShake: 0,
+  shakeIntensity: 0,
+  player: {
+    x: WORLD_W / 2, y: WORLD_H / 2,
+    hp: PLAYER_MAX_HP, maxHp: PLAYER_MAX_HP,
+    xp: 0, level: 1, xpToNext: xpForLevel(1),
+    weaponCooldown: 0,
+    damageCooldown: 0,
+    speed: PLAYER_SPEED,
+    damage: PROJECTILE_DAMAGE,
+    fireRate: WEAPON_COOLDOWN,
+    projectileCount: 1,
+    projectileSpeed: PROJECTILE_SPEED,
+    magnetRange: XP_MAGNET_RANGE,
+    area: 1.0,
+    armor: 0,
+    kills: 0,
+  },
+  spawnTimer: 0,
+  spawnRate: 1.5,
+  enemyHpMult: 1,
+  enemySpeedMult: 1,
+  waveNumber: 0,
+  upgrades: [],
+};
+
+// ── Input ──
+const keys = {};
+window.addEventListener('keydown', e => { keys[e.code] = true; if (['Space','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.code)) e.preventDefault(); });
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+// ── Create Player Sprite ──
+const playerGfx = new PIXI.Graphics();
+// Body
+playerGfx.circle(0, 0, PLAYER_RADIUS).fill(0x44bbff);
+// Eyes
+playerGfx.circle(-5, -5, 3).fill(0xffffff);
+playerGfx.circle(5, -5, 3).fill(0xffffff);
+playerGfx.circle(-5, -5, 1.5).fill(0x111122);
+playerGfx.circle(5, -5, 1.5).fill(0x111122);
+entityContainer.addChild(playerGfx);
+playerGfx.x = state.player.x;
+playerGfx.y = state.player.y;
+
+// ── Enemy Types ──
+const ENEMY_TYPES = {
+  swarmer: { radius: 8, color: 0xff4444, eyeOff: 3, eyeR: 2, hpMult: 0.6, speedMult: 1.6, xpMult: 0.7, dmgMult: 0.7 },
+  brute:   { radius: 18, color: 0xcc2266, eyeOff: 6, eyeR: 3.5, hpMult: 3.0, speedMult: 0.5, xpMult: 2.5, dmgMult: 1.8 },
+  dasher:  { radius: 10, color: 0xff8800, eyeOff: 4, eyeR: 2, hpMult: 1.0, speedMult: 1.0, xpMult: 1.2, dmgMult: 1.0 },
+};
+
+function pickEnemyType(timer) {
+  const r = Math.random();
+  if (timer < 30) return 'swarmer'; // first 30s only swarmers
+  if (timer < 60) return r < 0.7 ? 'swarmer' : 'brute';
+  // after 60s all three types
+  if (r < 0.5) return 'swarmer';
+  if (r < 0.75) return 'brute';
+  return 'dasher';
+}
+
+// ── Factories ──
+function makeEnemyGfx() {
+  const g = new PIXI.Graphics();
+  g.circle(0, 0, 12).fill(0xff4444);
+  g.circle(-4, -4, 2.5).fill(0xffffff);
+  g.circle(4, -4, 2.5).fill(0xffffff);
+  g.visible = false;
+  g._hp = 0; g._maxHp = 0; g._speed = 0; g._damageCd = 0;
+  g._type = 'swarmer'; g._radius = 12;
+  g._dashCd = 0; g._dashSpeed = 0; g._dashing = false; g._dashTimer = 0;
+  g._dmgMult = 1; g._xpMult = 1;
+  return g;
+}
+function resetEnemy(e) { e.visible = true; e._damageCd = 0; e._dashCd = 0; e._dashing = false; e._dashTimer = 0; e._dashSpeed = 0; }
+
+function makeProjGfx() {
+  const g = new PIXI.Graphics();
+  g.circle(0, 0, 5).fill(0xffdd44);
+  g.visible = false;
+  g._vx = 0; g._vy = 0; g._life = 0; g._damage = 0; g._area = 1;
+  return g;
+}
+function resetProj(p) { p.visible = true; p._life = 0; }
+
+function makeXpGfx() {
+  const g = new PIXI.Graphics();
+  g.star(0, 0, 4, 4, 8).fill(0x44ff88);
+  g.visible = false;
+  g._value = 0;
+  return g;
+}
+function resetXp(x) { x.visible = true; }
+
+function makeParticle() {
+  const g = new PIXI.Graphics();
+  g.circle(0, 0, 3).fill(0xffffff);
+  g.visible = false;
+  g._vx = 0; g._vy = 0; g._life = 0; g._maxLife = 0;
+  return g;
+}
+function resetParticle(p) { p.visible = true; p._life = 0; }
+
+const enemyPool = new Pool(makeEnemyGfx, resetEnemy, 300);
+const projPool = new Pool(makeProjGfx, resetProj, 200);
+const xpPool = new Pool(makeXpGfx, resetXp, 400);
+const particlePool = new Pool(makeParticle, resetParticle, 300);
+
+// ── Damage Numbers ──
+const dmgTexts = [];
+function spawnDamageNumber(x, y, value, color = 0xffffff) {
+  const t = new PIXI.Text({ text: Math.round(value).toString(), style: { fontFamily: 'monospace', fontSize: 16, fill: color, fontWeight: 'bold', stroke: { color: 0x000000, width: 3 } } });
+  t.anchor.set(0.5);
+  t.x = x + (Math.random() - 0.5) * 10;
+  t.y = y;
+  t._vy = -60 - Math.random() * 30;
+  t._life = 0;
+  t._maxLife = 0.6;
+  particleContainer.addChild(t);
+  dmgTexts.push(t);
+}
+function updateDamageNumbers(dt) {
+  for (let i = dmgTexts.length - 1; i >= 0; i--) {
+    const t = dmgTexts[i];
+    t._life += dt;
+    t.y += t._vy * dt;
+    t.alpha = 1 - t._life / t._maxLife;
+    if (t._life >= t._maxLife) {
+      if (t.parent) t.parent.removeChild(t);
+      t.destroy();
+      dmgTexts.splice(i, 1);
+    }
+  }
+}
+
+// ── Spawn helpers ──
+function spawnEnemy() {
+  const p = state.player;
+  const angle = Math.random() * Math.PI * 2;
+  const dist = SPAWN_RING_MIN + Math.random() * (SPAWN_RING_MAX - SPAWN_RING_MIN);
+  const ex = p.x + Math.cos(angle) * dist;
+  const ey = p.y + Math.sin(angle) * dist;
+  if (ex < 0 || ex > WORLD_W || ey < 0 || ey > WORLD_H) return;
+  const typeName = pickEnemyType(state.timer);
+  const et = ENEMY_TYPES[typeName];
+  const e = enemyPool.get();
+  e.x = ex; e.y = ey;
+  e._type = typeName;
+  e._radius = et.radius;
+  e._hp = ENEMY_BASE_HP * state.enemyHpMult * et.hpMult;
+  e._maxHp = e._hp;
+  e._speed = ENEMY_BASE_SPEED * state.enemySpeedMult * et.speedMult * (0.85 + Math.random() * 0.3);
+  e._dmgMult = et.dmgMult;
+  e._xpMult = et.xpMult;
+  // Redraw for this type
+  e.clear();
+  e.circle(0, 0, et.radius).fill(et.color);
+  e.circle(-et.eyeOff, -et.eyeOff * 0.8, et.eyeR).fill(0xffffff);
+  e.circle(et.eyeOff, -et.eyeOff * 0.8, et.eyeR).fill(0xffffff);
+  e.circle(-et.eyeOff, -et.eyeOff * 0.8, et.eyeR * 0.5).fill(0x111122);
+  e.circle(et.eyeOff, -et.eyeOff * 0.8, et.eyeR * 0.5).fill(0x111122);
+  // Brute gets horns
+  if (typeName === 'brute') {
+    e.moveTo(-10, -12).lineTo(-14, -22).lineTo(-6, -14).fill(et.color);
+    e.moveTo(10, -12).lineTo(14, -22).lineTo(6, -14).fill(et.color);
+  }
+  // Dasher gets arrow marking
+  if (typeName === 'dasher') {
+    e.moveTo(0, -et.radius).lineTo(4, -et.radius + 5).lineTo(-4, -et.radius + 5).fill(0xffcc00);
+  }
+  entityContainer.addChild(e);
+}
+
+function spawnXp(x, y, value) {
+  const gem = xpPool.get();
+  gem.x = x; gem.y = y;
+  gem._value = value;
+  entityContainer.addChild(gem);
+}
+
+function spawnParticles(x, y, color, count) {
+  for (let i = 0; i < count; i++) {
+    const p = particlePool.get();
+    p.x = x; p.y = y;
+    const angle = Math.random() * Math.PI * 2;
+    const speed = 50 + Math.random() * 150;
+    p._vx = Math.cos(angle) * speed;
+    p._vy = Math.sin(angle) * speed;
+    p._life = 0;
+    p._maxLife = 0.3 + Math.random() * 0.3;
+    p.tint = color;
+    particleContainer.addChild(p);
+  }
+}
+
+function fireProjectile() {
+  const p = state.player;
+  // Find nearest enemy
+  let nearest = null, nearDist = Infinity;
+  for (const e of enemyPool.active) {
+    const dx = e.x - p.x, dy = e.y - p.y;
+    const d = dx * dx + dy * dy;
+    if (d < nearDist) { nearDist = d; nearest = e; }
+  }
+  const count = p.projectileCount;
+  const baseAngle = nearest
+    ? Math.atan2(nearest.y - p.y, nearest.x - p.x)
+    : Math.random() * Math.PI * 2;
+  const spread = 0.2;
+  for (let i = 0; i < count; i++) {
+    const angle = baseAngle + (i - (count - 1) / 2) * spread;
+    const proj = projPool.get();
+    proj.x = p.x; proj.y = p.y;
+    proj._vx = Math.cos(angle) * p.projectileSpeed;
+    proj._vy = Math.sin(angle) * p.projectileSpeed;
+    proj._life = 0;
+    proj._damage = p.damage;
+    proj._area = p.area;
+    proj.scale.set(p.area);
+    entityContainer.addChild(proj);
+  }
+}
+
+// ── Screen Shake ──
+function addShake(intensity, duration) {
+  state.shakeIntensity = Math.max(state.shakeIntensity, intensity);
+  state.screenShake = Math.max(state.screenShake, duration);
+}
+
+// ── HUD ──
+const hudBg = new PIXI.Graphics();
+hudContainer.addChild(hudBg);
+
+const hpBarBg = new PIXI.Graphics();
+const hpBarFg = new PIXI.Graphics();
+const xpBarBg = new PIXI.Graphics();
+const xpBarFg = new PIXI.Graphics();
+hudContainer.addChild(hpBarBg, hpBarFg, xpBarBg, xpBarFg);
+
+const timerText = new PIXI.Text({ text: '3:00', style: { fontFamily: 'monospace', fontSize: 24, fill: 0xffffff, fontWeight: 'bold' } });
+timerText.anchor.set(0.5, 0);
+hudContainer.addChild(timerText);
+
+const levelText = new PIXI.Text({ text: 'Lv 1', style: { fontFamily: 'monospace', fontSize: 18, fill: 0x44ff88 } });
+hudContainer.addChild(levelText);
+
+const killText = new PIXI.Text({ text: 'Kills: 0', style: { fontFamily: 'monospace', fontSize: 16, fill: 0xcccccc } });
+hudContainer.addChild(killText);
+
+const enemyCountText = new PIXI.Text({ text: '', style: { fontFamily: 'monospace', fontSize: 14, fill: 0x999999 } });
+hudContainer.addChild(enemyCountText);
+
+function updateHUD() {
+  const sw = app.screen.width, p = state.player;
+  const barW = Math.min(300, sw - 40), barH = 14, margin = 15;
+
+  hpBarBg.clear().roundRect(margin, margin, barW, barH, 4).fill(0x331111);
+  const hpRatio = Math.max(0, p.hp / p.maxHp);
+  const hpColor = hpRatio > 0.5 ? 0x44ff44 : hpRatio > 0.25 ? 0xffaa00 : 0xff4444;
+  hpBarFg.clear().roundRect(margin, margin, barW * hpRatio, barH, 4).fill(hpColor);
+
+  const xpY = margin + barH + 6;
+  xpBarBg.clear().roundRect(margin, xpY, barW, 8, 3).fill(0x112211);
+  const xpRatio = Math.min(1, p.xp / p.xpToNext);
+  xpBarFg.clear().roundRect(margin, xpY, barW * xpRatio, 8, 3).fill(0x44ff88);
+
+  const remaining = Math.max(0, GAME_DURATION - state.timer);
+  const mins = Math.floor(remaining / 60);
+  const secs = Math.floor(remaining % 60);
+  timerText.text = `${mins}:${secs.toString().padStart(2, '0')}`;
+  timerText.x = sw / 2;
+  timerText.y = margin;
+
+  levelText.text = `Lv ${p.level}`;
+  levelText.x = margin;
+  levelText.y = xpY + 14;
+
+  killText.text = `Kills: ${p.kills}`;
+  killText.x = margin;
+  killText.y = xpY + 34;
+
+  enemyCountText.text = `Enemies: ${enemyPool.active.length}`;
+  enemyCountText.x = margin;
+  enemyCountText.y = xpY + 52;
+}
+
+// ── Upgrade System ──
+const ALL_UPGRADES = [
+  { id: 'damage', name: 'ATK Up', desc: '+25% Damage', icon: '\u2694', color: 0xff6644, apply: p => { p.damage *= 1.25; } },
+  { id: 'speed', name: 'Speed Up', desc: '+15% Move Speed', icon: '\u26A1', color: 0x44bbff, apply: p => { p.speed *= 1.15; } },
+  { id: 'fire_rate', name: 'Fire Rate', desc: '+20% Attack Speed', icon: '\u{1F525}', color: 0xff8800, apply: p => { p.fireRate *= 0.8; } },
+  { id: 'hp', name: 'Max HP', desc: '+25 Max HP & Heal', icon: '\u2764', color: 0xff4466, apply: p => { p.maxHp += 25; p.hp = Math.min(p.hp + 25, p.maxHp); } },
+  { id: 'magnet', name: 'Magnet', desc: '+40% Pickup Range', icon: '\u{1F9F2}', color: 0xaa44ff, apply: p => { p.magnetRange *= 1.4; } },
+  { id: 'multishot', name: 'Multi Shot', desc: '+1 Projectile', icon: '\u{1F4A0}', color: 0xffdd44, apply: p => { p.projectileCount += 1; } },
+  { id: 'area', name: 'Area Up', desc: '+20% Projectile Size', icon: '\u{1F4A5}', color: 0x66ff66, apply: p => { p.area *= 1.2; } },
+  { id: 'armor', name: 'Armor', desc: '-3 Damage Taken', icon: '\u{1F6E1}', color: 0x8888cc, apply: p => { p.armor += 3; } },
+  { id: 'proj_speed', name: 'Velocity', desc: '+20% Proj Speed', icon: '\u27A4', color: 0x44ddff, apply: p => { p.projectileSpeed *= 1.2; } },
+  { id: 'regen', name: 'Regen', desc: '+0.5 HP/sec', icon: '\u{1F33F}', color: 0x44ff88, apply: p => { p._regen = (p._regen || 0) + 0.5; } },
+];
+
+function getRandomUpgrades(count) {
+  const shuffled = [...ALL_UPGRADES].sort(() => Math.random() - 0.5);
+  return shuffled.slice(0, count);
+}
+
+// ── Level Up UI ──
+let levelUpChoices = [];
+let levelUpCards = [];
+
+function showLevelUp() {
+  state.phase = 'levelup';
+  levelUpChoices = getRandomUpgrades(3);
+  uiContainer.removeChildren();
+
+  // Overlay
+  const overlay = new PIXI.Graphics();
+  overlay.rect(0, 0, app.screen.width, app.screen.height).fill({ color: 0x000000, alpha: 0.6 });
+  uiContainer.addChild(overlay);
+
+  const title = new PIXI.Text({ text: `LEVEL UP! (Lv ${state.player.level})`, style: { fontFamily: 'monospace', fontSize: 32, fill: 0xffdd44, fontWeight: 'bold' } });
+  title.anchor.set(0.5, 0);
+  title.x = app.screen.width / 2;
+  title.y = app.screen.height * 0.15;
+  uiContainer.addChild(title);
+
+  const cardW = 180, cardH = 220, gap = 20;
+  const totalW = levelUpChoices.length * cardW + (levelUpChoices.length - 1) * gap;
+  const startX = (app.screen.width - totalW) / 2;
+  const cardY = app.screen.height * 0.3;
+
+  levelUpCards = [];
+  levelUpChoices.forEach((upgrade, i) => {
+    const card = new PIXI.Container();
+    card.x = startX + i * (cardW + gap);
+    card.y = cardY;
+    card.eventMode = 'static';
+    card.cursor = 'pointer';
+
+    const bg = new PIXI.Graphics();
+    bg.roundRect(0, 0, cardW, cardH, 12).fill(0x1a1a33);
+    bg.roundRect(0, 0, cardW, cardH, 12).stroke({ color: upgrade.color, width: 2 });
+    card.addChild(bg);
+
+    const iconText = new PIXI.Text({ text: upgrade.icon, style: { fontSize: 40 } });
+    iconText.anchor.set(0.5);
+    iconText.x = cardW / 2; iconText.y = 50;
+    card.addChild(iconText);
+
+    const nameText = new PIXI.Text({ text: upgrade.name, style: { fontFamily: 'monospace', fontSize: 20, fill: upgrade.color, fontWeight: 'bold' } });
+    nameText.anchor.set(0.5);
+    nameText.x = cardW / 2; nameText.y = 100;
+    card.addChild(nameText);
+
+    const descText = new PIXI.Text({ text: upgrade.desc, style: { fontFamily: 'monospace', fontSize: 14, fill: 0xcccccc, wordWrap: true, wordWrapWidth: cardW - 20 } });
+    descText.anchor.set(0.5);
+    descText.x = cardW / 2; descText.y = 140;
+    card.addChild(descText);
+
+    const keyLabel = new PIXI.Text({ text: `[${i + 1}]`, style: { fontFamily: 'monospace', fontSize: 18, fill: 0x888888 } });
+    keyLabel.anchor.set(0.5);
+    keyLabel.x = cardW / 2; keyLabel.y = cardH - 30;
+    card.addChild(keyLabel);
+
+    card.on('pointerdown', () => selectUpgrade(i));
+    uiContainer.addChild(card);
+    levelUpCards.push(card);
+  });
+}
+
+function selectUpgrade(index) {
+  const upgrade = levelUpChoices[index];
+  if (!upgrade) return;
+  upgrade.apply(state.player);
+  state.upgrades.push(upgrade.id);
+  uiContainer.removeChildren();
+  state.phase = 'playing';
+}
+
+// ── Game Over UI ──
+function showGameOver(won) {
+  state.phase = 'gameover';
+  uiContainer.removeChildren();
+
+  const overlay = new PIXI.Graphics();
+  overlay.rect(0, 0, app.screen.width, app.screen.height).fill({ color: 0x000000, alpha: 0.7 });
+  uiContainer.addChild(overlay);
+
+  const titleStr = won ? 'YOU SURVIVED!' : 'GAME OVER';
+  const titleColor = won ? 0x44ff88 : 0xff4444;
+  const title = new PIXI.Text({ text: titleStr, style: { fontFamily: 'monospace', fontSize: 48, fill: titleColor, fontWeight: 'bold' } });
+  title.anchor.set(0.5);
+  title.x = app.screen.width / 2;
+  title.y = app.screen.height * 0.3;
+  uiContainer.addChild(title);
+
+  const elapsed = Math.min(state.timer, GAME_DURATION);
+  const mins = Math.floor(elapsed / 60);
+  const secs = Math.floor(elapsed % 60);
+  const stats = [
+    `Time: ${mins}:${secs.toString().padStart(2, '0')}`,
+    `Level: ${state.player.level}`,
+    `Kills: ${state.player.kills}`,
+    `Score: ${state.player.kills * 10 + state.player.level * 50 + (won ? 1000 : 0)}`,
+  ].join('\n');
+
+  const statsText = new PIXI.Text({ text: stats, style: { fontFamily: 'monospace', fontSize: 22, fill: 0xcccccc, align: 'center', lineHeight: 32 } });
+  statsText.anchor.set(0.5);
+  statsText.x = app.screen.width / 2;
+  statsText.y = app.screen.height * 0.5;
+  uiContainer.addChild(statsText);
+
+  const restart = new PIXI.Text({ text: 'Press SPACE or Click to Restart', style: { fontFamily: 'monospace', fontSize: 20, fill: 0xffdd44 } });
+  restart.anchor.set(0.5);
+  restart.x = app.screen.width / 2;
+  restart.y = app.screen.height * 0.7;
+  uiContainer.addChild(restart);
+}
+
+// ── Title Screen ──
+function showTitle() {
+  state.phase = 'title';
+  uiContainer.removeChildren();
+
+  const overlay = new PIXI.Graphics();
+  overlay.rect(0, 0, app.screen.width, app.screen.height).fill({ color: 0x000000, alpha: 0.8 });
+  uiContainer.addChild(overlay);
+
+  const title = new PIXI.Text({ text: 'SURVIVOR ARENA', style: { fontFamily: 'monospace', fontSize: 52, fill: 0x44bbff, fontWeight: 'bold' } });
+  title.anchor.set(0.5);
+  title.x = app.screen.width / 2;
+  title.y = app.screen.height * 0.3;
+  uiContainer.addChild(title);
+
+  const sub = new PIXI.Text({ text: 'Survive 3 minutes. Auto-attack. Level up.', style: { fontFamily: 'monospace', fontSize: 18, fill: 0x888899 } });
+  sub.anchor.set(0.5);
+  sub.x = app.screen.width / 2;
+  sub.y = app.screen.height * 0.42;
+  uiContainer.addChild(sub);
+
+  const controls = new PIXI.Text({ text: 'WASD / Arrow Keys to move\nWeapons fire automatically\n\nPress SPACE or Click to Start', style: { fontFamily: 'monospace', fontSize: 16, fill: 0x667788, align: 'center', lineHeight: 26 } });
+  controls.anchor.set(0.5);
+  controls.x = app.screen.width / 2;
+  controls.y = app.screen.height * 0.6;
+  uiContainer.addChild(controls);
+}
+
+// ── Reset Game ──
+function resetGame() {
+  enemyPool.releaseAll();
+  projPool.releaseAll();
+  xpPool.releaseAll();
+  particlePool.releaseAll();
+  Object.assign(state.player, {
+    x: WORLD_W / 2, y: WORLD_H / 2,
+    hp: PLAYER_MAX_HP, maxHp: PLAYER_MAX_HP,
+    xp: 0, level: 1, xpToNext: xpForLevel(1),
+    weaponCooldown: 0, damageCooldown: 0,
+    speed: PLAYER_SPEED, damage: PROJECTILE_DAMAGE,
+    fireRate: WEAPON_COOLDOWN, projectileCount: 1,
+    projectileSpeed: PROJECTILE_SPEED,
+    magnetRange: XP_MAGNET_RANGE,
+    area: 1.0, armor: 0, kills: 0, _regen: 0,
+  });
+  state.timer = 0;
+  state.spawnTimer = 0;
+  state.spawnRate = 1.5;
+  state.enemyHpMult = 1;
+  state.enemySpeedMult = 1;
+  state.waveNumber = 0;
+  state.upgrades = [];
+  state.screenShake = 0;
+  state.shakeIntensity = 0;
+  playerGfx.x = state.player.x;
+  playerGfx.y = state.player.y;
+  uiContainer.removeChildren();
+  state.phase = 'playing';
+}
+
+// ── Input handlers for UI ──
+window.addEventListener('keydown', e => {
+  if (state.phase === 'title' && e.code === 'Space') { resetGame(); return; }
+  if (state.phase === 'gameover' && e.code === 'Space') { resetGame(); return; }
+  if (state.phase === 'levelup') {
+    if (e.code === 'Digit1' || e.code === 'Numpad1') selectUpgrade(0);
+    if (e.code === 'Digit2' || e.code === 'Numpad2') selectUpgrade(1);
+    if (e.code === 'Digit3' || e.code === 'Numpad3') selectUpgrade(2);
+  }
+});
+app.canvas.addEventListener('pointerdown', () => {
+  if (state.phase === 'title') resetGame();
+  if (state.phase === 'gameover') resetGame();
+});
+
+// ── Difficulty scaling ──
+function updateDifficulty(dt) {
+  state.timer += dt;
+  const t = state.timer;
+  // Spawn faster over time
+  state.spawnRate = Math.max(0.15, 1.5 - t * 0.007);
+  // Enemies get tougher
+  state.enemyHpMult = 1 + t * 0.015;
+  state.enemySpeedMult = 1 + t * 0.003;
+  // Spawn timer
+  state.spawnTimer -= dt;
+  if (state.spawnTimer <= 0) {
+    const count = 1 + Math.floor(t / 30);
+    for (let i = 0; i < count && enemyPool.active.length < 200; i++) spawnEnemy();
+    state.spawnTimer = state.spawnRate;
+  }
+}
+
+// ── Main Game Loop ──
+app.ticker.add((ticker) => {
+  const dt = ticker.deltaMS / 1000;
+
+  if (state.phase === 'title') return;
+  if (state.phase === 'gameover') return;
+  if (state.phase === 'levelup') return;
+
+  const p = state.player;
+
+  // ── Player Movement ──
+  let mx = 0, my = 0;
+  if (keys['KeyW'] || keys['ArrowUp']) my = -1;
+  if (keys['KeyS'] || keys['ArrowDown']) my = 1;
+  if (keys['KeyA'] || keys['ArrowLeft']) mx = -1;
+  if (keys['KeyD'] || keys['ArrowRight']) mx = 1;
+  if (mx !== 0 && my !== 0) { mx *= 0.7071; my *= 0.7071; }
+  p.x += mx * p.speed * dt;
+  p.y += my * p.speed * dt;
+  p.x = Math.max(PLAYER_RADIUS, Math.min(WORLD_W - PLAYER_RADIUS, p.x));
+  p.y = Math.max(PLAYER_RADIUS, Math.min(WORLD_H - PLAYER_RADIUS, p.y));
+  playerGfx.x = p.x;
+  playerGfx.y = p.y;
+
+  // Player flash on damage
+  if (p.damageCooldown > 0) {
+    p.damageCooldown -= dt;
+    playerGfx.alpha = (Math.floor(p.damageCooldown * 10) % 2 === 0) ? 0.5 : 1;
+  } else {
+    playerGfx.alpha = 1;
+  }
+
+  // Regen
+  if (p._regen && p._regen > 0) {
+    p.hp = Math.min(p.maxHp, p.hp + p._regen * dt);
+  }
+
+  // ── Difficulty & Spawning ──
+  updateDifficulty(dt);
+
+  // ── Check win condition ──
+  if (state.timer >= GAME_DURATION) {
+    showGameOver(true);
+    return;
+  }
+
+  // ── Auto-attack ──
+  p.weaponCooldown -= dt;
+  if (p.weaponCooldown <= 0 && enemyPool.active.length > 0) {
+    fireProjectile();
+    p.weaponCooldown = p.fireRate;
+  }
+
+  // ── Update projectiles ──
+  for (let i = projPool.active.length - 1; i >= 0; i--) {
+    const proj = projPool.active[i];
+    proj._life += dt;
+    if (proj._life > PROJECTILE_LIFETIME || proj.x < -50 || proj.x > WORLD_W + 50 || proj.y < -50 || proj.y > WORLD_H + 50) {
+      projPool.release(proj);
+      continue;
+    }
+    proj.x += proj._vx * dt;
+    proj.y += proj._vy * dt;
+
+    // Check collision with enemies
+    const projR = 5 * proj._area;
+    for (let j = enemyPool.active.length - 1; j >= 0; j--) {
+      const e = enemyPool.active[j];
+      const dx = proj.x - e.x, dy = proj.y - e.y;
+      const dist = dx * dx + dy * dy;
+      const hitR = projR + e._radius;
+      if (dist < hitR * hitR) {
+        e._hp -= proj._damage;
+        spawnDamageNumber(e.x, e.y - e._radius, proj._damage, 0xffdd44);
+        e.tint = 0xffffff; setTimeout(() => { if (e.visible) e.tint = 0xffffff; }, 0);
+        spawnParticles(e.x, e.y, ENEMY_TYPES[e._type]?.color || 0xff6644, 3);
+        projPool.release(proj);
+        if (e._hp <= 0) {
+          const xpVal = Math.ceil((1 + Math.floor(state.timer / 30)) * e._xpMult);
+          spawnXp(e.x, e.y, xpVal);
+          spawnParticles(e.x, e.y, ENEMY_TYPES[e._type]?.color || 0xff4444, 6);
+          enemyPool.release(e);
+          p.kills++;
+          addShake(e._type === 'brute' ? 4 : 2, e._type === 'brute' ? 0.14 : 0.08);
+        }
+        break;
+      }
+    }
+  }
+
+  // ── Update enemies ──
+  for (let i = enemyPool.active.length - 1; i >= 0; i--) {
+    const e = enemyPool.active[i];
+    const dx = p.x - e.x, dy = p.y - e.y;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+
+    // Dasher behavior: charge at player periodically
+    if (e._type === 'dasher') {
+      e._dashCd -= dt;
+      if (e._dashing) {
+        e._dashTimer -= dt;
+        e.x += e._dashVx * dt;
+        e.y += e._dashVy * dt;
+        if (e._dashTimer <= 0) { e._dashing = false; e._dashCd = 2.5 + Math.random(); }
+      } else if (e._dashCd <= 0 && dist < 300 && dist > 30) {
+        e._dashing = true;
+        e._dashTimer = 0.35;
+        const dashSpd = e._speed * 5;
+        e._dashVx = (dx / dist) * dashSpd;
+        e._dashVy = (dy / dist) * dashSpd;
+        e._dashCd = 3;
+        spawnParticles(e.x, e.y, 0xff8800, 3);
+      } else if (dist > 1) {
+        e.x += (dx / dist) * e._speed * dt;
+        e.y += (dy / dist) * e._speed * dt;
+      }
+    } else if (dist > 1) {
+      e.x += (dx / dist) * e._speed * dt;
+      e.y += (dy / dist) * e._speed * dt;
+    }
+    e._damageCd -= dt;
+
+    // Enemy-player collision (use per-enemy radius)
+    const hitDist = PLAYER_RADIUS + e._radius;
+    if (dist < hitDist && e._damageCd <= 0) {
+      const dmg = Math.max(1, Math.round(ENEMY_DAMAGE * e._dmgMult) - p.armor);
+      p.hp -= dmg;
+      p.damageCooldown = ENEMY_DAMAGE_COOLDOWN;
+      e._damageCd = ENEMY_DAMAGE_COOLDOWN;
+      addShake(e._type === 'brute' ? 6 : 4, e._type === 'brute' ? 0.18 : 0.12);
+      spawnParticles(p.x, p.y, 0xff4444, e._type === 'brute' ? 6 : 4);
+      if (p.hp <= 0) {
+        showGameOver(false);
+        return;
+      }
+    }
+  }
+
+  // ── Update XP gems ──
+  for (let i = xpPool.active.length - 1; i >= 0; i--) {
+    const gem = xpPool.active[i];
+    const dx = p.x - gem.x, dy = p.y - gem.y;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    if (dist < XP_COLLECT_RANGE) {
+      p.xp += gem._value;
+      xpPool.release(gem);
+      // Level up check
+      while (p.xp >= p.xpToNext) {
+        p.xp -= p.xpToNext;
+        p.level++;
+        p.xpToNext = xpForLevel(p.level);
+        showLevelUp();
+        return;
+      }
+    } else if (dist < p.magnetRange) {
+      const speed = XP_MAGNET_SPEED * dt;
+      gem.x += (dx / dist) * speed;
+      gem.y += (dy / dist) * speed;
+    }
+  }
+
+  // ── Update particles ──
+  for (let i = particlePool.active.length - 1; i >= 0; i--) {
+    const pt = particlePool.active[i];
+    pt._life += dt;
+    if (pt._life >= pt._maxLife) { particlePool.release(pt); continue; }
+    pt.x += pt._vx * dt;
+    pt.y += pt._vy * dt;
+    pt.alpha = 1 - pt._life / pt._maxLife;
+    pt.scale.set(1 - pt._life / pt._maxLife);
+  }
+
+  // ── Damage Numbers ──
+  updateDamageNumbers(dt);
+
+  // ── Camera ──
+  let shakeX = 0, shakeY = 0;
+  if (state.screenShake > 0) {
+    state.screenShake -= dt;
+    shakeX = (Math.random() - 0.5) * state.shakeIntensity * 2;
+    shakeY = (Math.random() - 0.5) * state.shakeIntensity * 2;
+    state.shakeIntensity *= 0.9;
+  }
+  worldContainer.x = -p.x + app.screen.width / 2 + shakeX;
+  worldContainer.y = -p.y + app.screen.height / 2 + shakeY;
+
+  // ── HUD ──
+  updateHUD();
+});
+
+// ── Start ──
+showTitle();
+
+})();
+</script>
+</body>
+</html>
