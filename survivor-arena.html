@@ -421,6 +421,11 @@ const state = {
   enemySpeedMult: 1,
   waveNumber: 0,
   upgradeHistory: [],
+  // Kill combo
+  combo: 0,
+  comboTimer: 0,
+  comboMax: 0,
+  comboBestThisRun: 0,
 };
 
 // ── Input ──
@@ -567,12 +572,14 @@ function makeEnemyGfx() {
   g._shootCd = 0; g._stunTimer = 0;
   g._explodeRadius = 0; g._isBoss = false;
   g._bossPhase = 0; g._bossChargeCd = 0;
+  g._isElite = false; g._eliteGlow = 0;
   return g;
 }
 function resetEnemy(e) {
   e.visible = true; e._damageCd = 0; e._dashCd = 0; e._dashing = false;
   e._dashTimer = 0; e._dashSpeed = 0; e._shootCd = 2 + Math.random() * 2;
   e._stunTimer = 0; e._isBoss = false; e._bossPhase = 0; e._bossChargeCd = 5;
+  e._isElite = false; e._eliteGlow = 0;
   e.scale.set(1); e.alpha = 1;
 }
 
@@ -645,6 +652,85 @@ const particlePool = new Pool(makeParticle, resetParticle, 400);
 const firePool = new Pool(makeFireZone, resetFireZone, 100);
 const orbPool = new Pool(makeOrbGfx, resetOrb, 20);
 const goldPool = new Pool(makeGoldGfx, resetGold, 200);
+
+// Chest drop visual
+const CHEST_TYPES = ['heal', 'gold', 'xpbomb'];
+function makeChestGfx() {
+  const g = new PIXI.Graphics();
+  // Body
+  g.roundRect(-8, -6, 16, 12, 2).fill(0xcc8833);
+  // Lid
+  g.roundRect(-9, -8, 18, 5, 2).fill(0xddaa44);
+  // Clasp
+  g.circle(0, -1, 2).fill(0xffdd44);
+  g.visible = false;
+  g._chestType = 'gold'; g._life = 0;
+  return g;
+}
+function resetChest(c) { c.visible = true; c._life = 0; c.scale.set(1); c.alpha = 1; }
+const chestPool = new Pool(makeChestGfx, resetChest, 50);
+
+function spawnChest(x, y) {
+  const c = chestPool.get();
+  c.x = x; c.y = y;
+  c._chestType = CHEST_TYPES[Math.floor(Math.random() * CHEST_TYPES.length)];
+  c._life = 0;
+  entityContainer.addChild(c);
+  return c;
+}
+
+function collectChest(c) {
+  const p = state.player;
+  if (c._chestType === 'heal') {
+    const healAmt = Math.ceil(p.maxHp * 0.25);
+    p.hp = Math.min(p.maxHp, p.hp + healAmt);
+    spawnDamageNumber(c.x, c.y - 10, healAmt, 0x44ff88);
+    spawnParticles(c.x, c.y, 0x44ff88, 8);
+  } else if (c._chestType === 'gold') {
+    const goldAmt = 15 + Math.floor(Math.random() * 16);
+    state.goldEarned += goldAmt;
+    spawnDamageNumber(c.x, c.y - 10, goldAmt, 0xffdd44);
+    spawnParticles(c.x, c.y, 0xffdd44, 8);
+    playSfx('goldPickup');
+  } else if (c._chestType === 'xpbomb') {
+    const xpAmt = Math.ceil(p.xpToNext * 0.5);
+    p.xp += xpAmt;
+    spawnDamageNumber(c.x, c.y - 10, xpAmt, 0xaa88ff);
+    spawnParticles(c.x, c.y, 0xaa88ff, 8);
+    playSfx('xp');
+    if (p.xp >= p.xpToNext) {
+      p.xp -= p.xpToNext;
+      p.level++;
+      p.xpToNext = xpForLevel(p.level);
+      showLevelUp();
+    }
+  }
+  playSfx('purchase');
+  chestPool.release(c);
+}
+
+function updateChests(dt) {
+  const p = state.player;
+  for (let i = chestPool.active.length - 1; i >= 0; i--) {
+    const c = chestPool.active[i];
+    c._life += dt;
+    // Bob animation
+    c.y += Math.sin(c._life * 3) * 0.2;
+    // Gentle pulse
+    c.scale.set(1 + Math.sin(c._life * 4) * 0.08);
+    const dx = p.x - c.x, dy = p.y - c.y;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    if (dist < PLAYER_RADIUS + 12) {
+      collectChest(c);
+      continue;
+    }
+    // Despawn after 20 seconds
+    if (c._life > 20) {
+      c.alpha = Math.max(0, 1 - (c._life - 20) / 2);
+      if (c._life > 22) chestPool.release(c);
+    }
+  }
+}
 
 // ── Damage Numbers ──
 const dmgTexts = [];
@@ -771,6 +857,18 @@ function spawnEnemy(forceType) {
     e.circle(0, 5, 10).fill(0x220000);
     e.circle(-4, 3, 3).fill(0xff0000);
     e.circle(4, 3, 3).fill(0xff0000);
+  }
+  // Elite enemy roll (8% chance, not boss)
+  if (typeName !== 'boss' && Math.random() < 0.08) {
+    e._isElite = true;
+    e._hp *= 3;
+    e._maxHp = e._hp;
+    e._speed *= 1.3;
+    e._xpMult *= 3;
+    e._goldMult *= 3;
+    e.scale.set(1.5);
+    // Draw elite glow ring
+    e.circle(0, 0, et.radius + 4).stroke({ color: 0xffdd44, width: 2, alpha: 0.8 });
   }
   entityContainer.addChild(e);
   return e;
@@ -1129,12 +1227,21 @@ function damageEnemy(e, damage, color) {
 }
 
 function killEnemy(e) {
-  const xpVal = Math.ceil((1 + Math.floor(state.timer / 30)) * e._xpMult);
+  // Kill combo
+  state.combo++;
+  state.comboTimer = 2.0;
+  if (state.combo > state.comboBestThisRun) state.comboBestThisRun = state.combo;
+  const comboMult = Math.min(state.combo, 10);
+  const xpVal = Math.ceil((1 + Math.floor(state.timer / 30)) * e._xpMult * (1 + (comboMult - 1) * 0.1));
   spawnXp(e.x, e.y, xpVal);
-  // Drop gold
-  const goldVal = Math.max(1, Math.ceil(e._goldMult * (1 + state.timer / 120)));
-  if (Math.random() < 0.4 || e._isBoss) {
+  // Drop gold (combo boosts gold value)
+  const goldVal = Math.max(1, Math.ceil(e._goldMult * (1 + state.timer / 120) * (1 + (comboMult - 1) * 0.15)));
+  if (Math.random() < 0.4 || e._isBoss || e._isElite) {
     spawnGold(e.x, e.y, goldVal);
+  }
+  // Treasure chest drop
+  if (e._isElite || (e._isBoss) || Math.random() < 0.02) {
+    spawnChest(e.x, e.y);
   }
   spawnParticles(e.x, e.y, ENEMY_TYPES[e._type]?.color || 0xff4444, 6);
   playSfx('kill');
@@ -1162,6 +1269,11 @@ function killEnemy(e) {
       }
     }
     addShake(5, 0.2);
+  }
+  if (e._isElite) {
+    addShake(6, 0.2);
+    spawnParticles(e.x, e.y, 0xffdd44, 12);
+    playSfx('levelup');
   }
   if (e._isBoss) {
     state.bossDefeated = true;
@@ -1414,6 +1526,7 @@ function showGameOver(won) {
     `Level: ${state.player.level}`,
     `Kills: ${state.player.kills}`,
     `Weapons: ${weaponList || 'None'}`,
+    `Best Combo: x${state.comboBestThisRun}`,
     `Boss: ${state.bossDefeated ? 'Defeated!' : state.bossSpawned ? 'Not defeated' : 'Not reached'}`,
     `Score: ${score}`,
     ``,
@@ -1672,6 +1785,10 @@ function resetGame() {
   state.bossDefeated = false;
   state.goldEarned = 0;
   state.runScore = 0;
+  state.combo = 0;
+  state.comboTimer = 0;
+  state.comboBestThisRun = 0;
+  chestPool.releaseAll();
   playerGfx.x = state.player.x;
   playerGfx.y = state.player.y;
   uiContainer.removeChildren();
@@ -1731,6 +1848,16 @@ hudContainer.addChild(weaponSlotsText);
 const goldHudText = new PIXI.Text({ text: '', style: { fontFamily: 'monospace', fontSize: 16, fill: 0xffdd44 } });
 hudContainer.addChild(goldHudText);
 
+const comboText = new PIXI.Text({ text: '', style: { fontFamily: 'monospace', fontSize: 28, fill: 0xffffff, fontWeight: 'bold', stroke: { color: 0x000000, width: 4 } } });
+comboText.anchor.set(0.5, 0);
+hudContainer.addChild(comboText);
+
+// Mini-map
+const minimapGfx = new PIXI.Graphics();
+hudContainer.addChild(minimapGfx);
+const MINIMAP_SIZE = 100;
+const MINIMAP_MARGIN = 10;
+
 // Boss HP bar
 const bossHpBg = new PIXI.Graphics();
 const bossHpFg = new PIXI.Graphics();
@@ -1783,6 +1910,47 @@ function updateHUD() {
   weaponSlotsText.text = weaponStr;
   weaponSlotsText.x = margin;
   weaponSlotsText.y = xpY + 70;
+
+  // Combo display
+  if (state.combo >= 2) {
+    const comboVal = Math.min(state.combo, 10);
+    const comboColor = comboVal >= 8 ? 0xff2244 : comboVal >= 5 ? 0xff8800 : comboVal >= 3 ? 0xffdd44 : 0xffffff;
+    comboText.style.fill = comboColor;
+    comboText.text = `x${state.combo} COMBO`;
+    comboText.x = sw / 2;
+    comboText.y = margin + 30;
+    comboText.visible = true;
+    // Pulse effect based on combo timer
+    const pulse = 1 + Math.sin(state.comboTimer * 8) * 0.1;
+    comboText.scale.set(pulse);
+  } else {
+    comboText.visible = false;
+  }
+
+  // Mini-map
+  const mmX = sw - MINIMAP_SIZE - MINIMAP_MARGIN;
+  const mmY = margin + 30;
+  const mmScale = MINIMAP_SIZE / WORLD_W;
+  minimapGfx.clear();
+  // Background
+  minimapGfx.roundRect(mmX - 2, mmY - 2, MINIMAP_SIZE + 4, MINIMAP_SIZE + 4, 4).fill({ color: 0x000000, alpha: 0.5 });
+  minimapGfx.roundRect(mmX, mmY, MINIMAP_SIZE, MINIMAP_SIZE, 3).stroke({ color: 0x444466, width: 1 });
+  // Enemies
+  for (const e of enemyPool.active) {
+    if (!e.visible) continue;
+    const ex = mmX + e.x * mmScale;
+    const ey = mmY + e.y * mmScale;
+    const dotR = e._isBoss ? 3 : e._isElite ? 2 : 1;
+    const dotColor = e._isBoss ? 0xff2244 : e._isElite ? 0xffdd44 : 0xff4444;
+    minimapGfx.circle(ex, ey, dotR).fill(dotColor);
+  }
+  // Chests
+  for (const c of chestPool.active) {
+    if (!c.visible) continue;
+    minimapGfx.circle(mmX + c.x * mmScale, mmY + c.y * mmScale, 2).fill(0xffdd44);
+  }
+  // Player
+  minimapGfx.circle(mmX + p.x * mmScale, mmY + p.y * mmScale, 2.5).fill(0xffffff);
 
   // Boss HP bar
   const boss = enemyPool.active.find(e => e._isBoss);
@@ -2010,6 +2178,13 @@ app.ticker.add((ticker) => {
     }
     e.alpha = 1;
 
+    // Elite pulsing scale
+    if (e._isElite) {
+      e._eliteGlow += dt;
+      const pulse = 1.5 + Math.sin(e._eliteGlow * 4) * 0.1;
+      e.scale.set(pulse);
+    }
+
     // Boss behavior
     if (e._isBoss) {
       e._bossChargeCd -= dt;
@@ -2201,6 +2376,18 @@ app.ticker.add((ticker) => {
 
   // ── Damage Numbers ──
   updateDamageNumbers(dt);
+
+  // ── Kill Combo Decay ──
+  if (state.comboTimer > 0) {
+    state.comboTimer -= dt;
+    if (state.comboTimer <= 0) {
+      state.combo = 0;
+      state.comboTimer = 0;
+    }
+  }
+
+  // ── Update Chests ──
+  updateChests(dt);
 
   // ── Camera ──
   let shakeX = 0, shakeY = 0;
