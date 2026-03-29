@@ -19,14 +19,10 @@ canvas { display: block; }
 'use strict';
 
 // ── Constants ──
-const WORLD_W = 3000, WORLD_H = 3000;
+const WORLD_W = 4000, WORLD_H = 4000;
 const PLAYER_SPEED = 200;
 const PLAYER_MAX_HP = 100;
 const PLAYER_RADIUS = 14;
-const PROJECTILE_SPEED = 400;
-const PROJECTILE_DAMAGE = 20;
-const PROJECTILE_LIFETIME = 1.2;
-const WEAPON_COOLDOWN = 0.45;
 const ENEMY_BASE_HP = 30;
 const ENEMY_BASE_SPEED = 60;
 const ENEMY_DAMAGE = 8;
@@ -34,10 +30,12 @@ const ENEMY_DAMAGE_COOLDOWN = 0.5;
 const XP_MAGNET_RANGE = 80;
 const XP_COLLECT_RANGE = 18;
 const XP_MAGNET_SPEED = 350;
-const GAME_DURATION = 180; // 3 minutes
+const GAME_DURATION = 600; // 10 minutes
+const BOSS_TIME = 300; // Boss at 5 minutes
 const POOL_MAX = 500;
 const SPAWN_RING_MIN = 450;
-const SPAWN_RING_MAX = 600;
+const SPAWN_RING_MAX = 650;
+const MAX_WEAPONS = 6;
 
 // ── XP curve ──
 function xpForLevel(lvl) { return 10 + lvl * 8; }
@@ -94,40 +92,123 @@ function drawBackground() {
   for (let y = 0; y <= WORLD_H; y += gridSize) {
     g.moveTo(0, y).lineTo(WORLD_W, y).stroke({ color: 0x1a1a33, width: 1 });
   }
-  // Arena boundary
   g.rect(0, 0, WORLD_W, WORLD_H).stroke({ color: 0x334466, width: 3 });
   bgContainer.addChild(g);
 }
 drawBackground();
 
-// ── Game State ──
+// ═══════════════════════════════════════════
+// ── WEAPON DEFINITIONS ──
+// ═══════════════════════════════════════════
+const WEAPON_DEFS = {
+  projectile: {
+    name: 'Magic Bolt', icon: '\u{1F4A0}', color: 0xffdd44,
+    desc: 'Fires homing bolts at nearest enemy',
+    baseCooldown: 0.45, baseDamage: 20,
+    levels: [
+      { desc: 'Magic Bolt' },
+      { desc: '+30% damage', dmgMult: 1.3 },
+      { desc: '+1 projectile', extraProj: 1 },
+      { desc: '+30% damage', dmgMult: 1.3 },
+      { desc: '+1 projectile, piercing', extraProj: 1, pierce: true },
+    ]
+  },
+  orbit: {
+    name: 'Orbit Shield', icon: '\u{1F6E1}\uFE0F', color: 0x44bbff,
+    desc: 'Orbs spin around you damaging enemies',
+    baseCooldown: 0, baseDamage: 15,
+    levels: [
+      { desc: 'Orbit Shield (2 orbs)', orbCount: 2 },
+      { desc: '+1 orb', orbCount: 3 },
+      { desc: '+30% damage', dmgMult: 1.3 },
+      { desc: '+1 orb, wider orbit', orbCount: 4, radiusMult: 1.2 },
+      { desc: '+1 orb, +30% damage', orbCount: 5, dmgMult: 1.3 },
+    ]
+  },
+  nova: {
+    name: 'Nova Blast', icon: '\u{1F4A5}', color: 0xff66aa,
+    desc: 'Periodic explosion around the player',
+    baseCooldown: 3.0, baseDamage: 35,
+    levels: [
+      { desc: 'Nova Blast' },
+      { desc: '+40% area', areaMult: 1.4 },
+      { desc: '-20% cooldown', cdMult: 0.8 },
+      { desc: '+50% damage', dmgMult: 1.5 },
+      { desc: '+50% area, stun', areaMult: 1.5, stun: true },
+    ]
+  },
+  chain: {
+    name: 'Chain Lightning', icon: '\u26A1', color: 0x88ddff,
+    desc: 'Lightning jumps between nearby enemies',
+    baseCooldown: 1.2, baseDamage: 18,
+    levels: [
+      { desc: 'Chain Lightning (3 bounces)', bounces: 3 },
+      { desc: '+2 bounces', bounces: 5 },
+      { desc: '+40% damage', dmgMult: 1.4 },
+      { desc: '+2 bounces', bounces: 7 },
+      { desc: '+50% damage, stun', dmgMult: 1.5, stun: true },
+    ]
+  },
+  boomerang: {
+    name: 'Boomerang', icon: '\u{1FA83}', color: 0xff8844,
+    desc: 'Thrown blade that returns to you',
+    baseCooldown: 1.5, baseDamage: 25,
+    levels: [
+      { desc: 'Boomerang' },
+      { desc: '+1 boomerang', extraProj: 1 },
+      { desc: '+30% damage, wider arc', dmgMult: 1.3 },
+      { desc: '+1 boomerang', extraProj: 1 },
+      { desc: '+50% damage, +30% speed', dmgMult: 1.5 },
+    ]
+  },
+  groundfire: {
+    name: 'Ground Fire', icon: '\u{1F525}', color: 0xff4400,
+    desc: 'Leaves a trail of fire behind you',
+    baseCooldown: 0.3, baseDamage: 8,
+    levels: [
+      { desc: 'Ground Fire' },
+      { desc: '+40% damage', dmgMult: 1.4 },
+      { desc: 'Wider trail', widthMult: 1.5 },
+      { desc: '+50% damage', dmgMult: 1.5 },
+      { desc: 'Fire lasts longer, +40% damage', dmgMult: 1.4, durationMult: 1.5 },
+    ]
+  },
+};
+
+// ═══════════════════════════════════════════
+// ── GAME STATE ──
+// ═══════════════════════════════════════════
 const state = {
-  phase: 'title', // title, playing, levelup, gameover
+  phase: 'title',
   timer: 0,
   screenShake: 0,
   shakeIntensity: 0,
+  bossSpawned: false,
+  bossDefeated: false,
   player: {
     x: WORLD_W / 2, y: WORLD_H / 2,
     hp: PLAYER_MAX_HP, maxHp: PLAYER_MAX_HP,
     xp: 0, level: 1, xpToNext: xpForLevel(1),
-    weaponCooldown: 0,
     damageCooldown: 0,
     speed: PLAYER_SPEED,
-    damage: PROJECTILE_DAMAGE,
-    fireRate: WEAPON_COOLDOWN,
-    projectileCount: 1,
-    projectileSpeed: PROJECTILE_SPEED,
     magnetRange: XP_MAGNET_RANGE,
     area: 1.0,
     armor: 0,
     kills: 0,
+    _regen: 0,
+    // Weapon slots: each has {type, level, cooldown, ...runtime state}
+    weapons: [],
+    // Passive bonuses (multiplicative)
+    passives: {
+      damage: 1, speed: 1, area: 1, cooldown: 1, maxHp: 0, armor: 0, magnetRange: 1, regen: 0,
+    },
   },
   spawnTimer: 0,
   spawnRate: 1.5,
   enemyHpMult: 1,
   enemySpeedMult: 1,
   waveNumber: 0,
-  upgrades: [],
+  upgradeHistory: [],
 };
 
 // ── Input ──
@@ -137,57 +218,86 @@ window.addEventListener('keyup', e => { keys[e.code] = false; });
 
 // ── Create Player Sprite ──
 const playerGfx = new PIXI.Graphics();
-// Body
 playerGfx.circle(0, 0, PLAYER_RADIUS).fill(0x44bbff);
-// Eyes
 playerGfx.circle(-5, -5, 3).fill(0xffffff);
 playerGfx.circle(5, -5, 3).fill(0xffffff);
 playerGfx.circle(-5, -5, 1.5).fill(0x111122);
 playerGfx.circle(5, -5, 1.5).fill(0x111122);
 entityContainer.addChild(playerGfx);
-playerGfx.x = state.player.x;
-playerGfx.y = state.player.y;
 
-// ── Enemy Types ──
+// ═══════════════════════════════════════════
+// ── ENEMY TYPES ──
+// ═══════════════════════════════════════════
 const ENEMY_TYPES = {
-  swarmer: { radius: 8, color: 0xff4444, eyeOff: 3, eyeR: 2, hpMult: 0.6, speedMult: 1.6, xpMult: 0.7, dmgMult: 0.7 },
-  brute:   { radius: 18, color: 0xcc2266, eyeOff: 6, eyeR: 3.5, hpMult: 3.0, speedMult: 0.5, xpMult: 2.5, dmgMult: 1.8 },
-  dasher:  { radius: 10, color: 0xff8800, eyeOff: 4, eyeR: 2, hpMult: 1.0, speedMult: 1.0, xpMult: 1.2, dmgMult: 1.0 },
+  swarmer:  { radius: 8,  color: 0xff4444, eyeOff: 3,  eyeR: 2,   hpMult: 0.6, speedMult: 1.6, xpMult: 0.7, dmgMult: 0.7 },
+  brute:    { radius: 18, color: 0xcc2266, eyeOff: 6,  eyeR: 3.5, hpMult: 3.0, speedMult: 0.5, xpMult: 2.5, dmgMult: 1.8 },
+  dasher:   { radius: 10, color: 0xff8800, eyeOff: 4,  eyeR: 2,   hpMult: 1.0, speedMult: 1.0, xpMult: 1.2, dmgMult: 1.0 },
+  ranged:   { radius: 10, color: 0xaa44ff, eyeOff: 4,  eyeR: 2.5, hpMult: 0.8, speedMult: 0.7, xpMult: 1.5, dmgMult: 0.5 },
+  exploder: { radius: 12, color: 0x44ff44, eyeOff: 4,  eyeR: 2.5, hpMult: 0.5, speedMult: 1.3, xpMult: 1.0, dmgMult: 0.3 },
+  boss:     { radius: 36, color: 0xff2244, eyeOff: 12, eyeR: 6,   hpMult: 80,  speedMult: 0.35, xpMult: 50, dmgMult: 3.0 },
 };
 
 function pickEnemyType(timer) {
   const r = Math.random();
-  if (timer < 30) return 'swarmer'; // first 30s only swarmers
+  if (timer < 30) return 'swarmer';
   if (timer < 60) return r < 0.7 ? 'swarmer' : 'brute';
-  // after 60s all three types
-  if (r < 0.5) return 'swarmer';
-  if (r < 0.75) return 'brute';
-  return 'dasher';
+  if (timer < 120) {
+    if (r < 0.4) return 'swarmer';
+    if (r < 0.6) return 'brute';
+    if (r < 0.8) return 'dasher';
+    return 'ranged';
+  }
+  if (timer < 240) {
+    if (r < 0.3) return 'swarmer';
+    if (r < 0.5) return 'brute';
+    if (r < 0.65) return 'dasher';
+    if (r < 0.8) return 'ranged';
+    return 'exploder';
+  }
+  // Late game: all types, more dangerous
+  if (r < 0.2) return 'swarmer';
+  if (r < 0.35) return 'brute';
+  if (r < 0.5) return 'dasher';
+  if (r < 0.7) return 'ranged';
+  return 'exploder';
 }
 
 // ── Factories ──
 function makeEnemyGfx() {
   const g = new PIXI.Graphics();
   g.circle(0, 0, 12).fill(0xff4444);
-  g.circle(-4, -4, 2.5).fill(0xffffff);
-  g.circle(4, -4, 2.5).fill(0xffffff);
   g.visible = false;
   g._hp = 0; g._maxHp = 0; g._speed = 0; g._damageCd = 0;
   g._type = 'swarmer'; g._radius = 12;
   g._dashCd = 0; g._dashSpeed = 0; g._dashing = false; g._dashTimer = 0;
   g._dmgMult = 1; g._xpMult = 1;
+  g._shootCd = 0; g._stunTimer = 0;
+  g._explodeRadius = 0; g._isBoss = false;
+  g._bossPhase = 0; g._bossChargeCd = 0;
   return g;
 }
-function resetEnemy(e) { e.visible = true; e._damageCd = 0; e._dashCd = 0; e._dashing = false; e._dashTimer = 0; e._dashSpeed = 0; }
+function resetEnemy(e) {
+  e.visible = true; e._damageCd = 0; e._dashCd = 0; e._dashing = false;
+  e._dashTimer = 0; e._dashSpeed = 0; e._shootCd = 2 + Math.random() * 2;
+  e._stunTimer = 0; e._isBoss = false; e._bossPhase = 0; e._bossChargeCd = 5;
+  e.scale.set(1); e.alpha = 1;
+}
 
 function makeProjGfx() {
   const g = new PIXI.Graphics();
   g.circle(0, 0, 5).fill(0xffdd44);
   g.visible = false;
   g._vx = 0; g._vy = 0; g._life = 0; g._damage = 0; g._area = 1;
+  g._type = 'projectile'; g._pierce = false; g._pierceHit = null;
+  g._boomerang = false; g._boomPhase = 0; g._boomAngle = 0;
+  g._originX = 0; g._originY = 0; g._boomDist = 0;
+  g._enemyProj = false;
   return g;
 }
-function resetProj(p) { p.visible = true; p._life = 0; }
+function resetProj(p) {
+  p.visible = true; p._life = 0; p._pierce = false; p._pierceHit = new Set();
+  p._boomerang = false; p._boomPhase = 0; p._enemyProj = false; p._type = 'projectile';
+}
 
 function makeXpGfx() {
   const g = new PIXI.Graphics();
@@ -207,10 +317,31 @@ function makeParticle() {
 }
 function resetParticle(p) { p.visible = true; p._life = 0; }
 
-const enemyPool = new Pool(makeEnemyGfx, resetEnemy, 300);
-const projPool = new Pool(makeProjGfx, resetProj, 200);
-const xpPool = new Pool(makeXpGfx, resetXp, 400);
-const particlePool = new Pool(makeParticle, resetParticle, 300);
+// Ground fire zones
+function makeFireZone() {
+  const g = new PIXI.Graphics();
+  g.visible = false;
+  g._life = 0; g._maxLife = 0; g._damage = 0; g._radius = 0; g._dmgCd = 0;
+  return g;
+}
+function resetFireZone(f) { f.visible = true; f._life = 0; f._dmgCd = 0; }
+
+// Orbit orbs (visual only, damage check done in update)
+function makeOrbGfx() {
+  const g = new PIXI.Graphics();
+  g.circle(0, 0, 8).fill(0x44bbff);
+  g.visible = false;
+  g._angle = 0; g._radius = 0; g._damage = 0; g._dmgCd = 0;
+  return g;
+}
+function resetOrb(o) { o.visible = true; o._dmgCd = 0; }
+
+const enemyPool = new Pool(makeEnemyGfx, resetEnemy, 400);
+const projPool = new Pool(makeProjGfx, resetProj, 300);
+const xpPool = new Pool(makeXpGfx, resetXp, 500);
+const particlePool = new Pool(makeParticle, resetParticle, 400);
+const firePool = new Pool(makeFireZone, resetFireZone, 100);
+const orbPool = new Pool(makeOrbGfx, resetOrb, 20);
 
 // ── Damage Numbers ──
 const dmgTexts = [];
@@ -239,15 +370,21 @@ function updateDamageNumbers(dt) {
   }
 }
 
+// ── Screen Shake ──
+function addShake(intensity, duration) {
+  state.shakeIntensity = Math.max(state.shakeIntensity, intensity);
+  state.screenShake = Math.max(state.screenShake, duration);
+}
+
 // ── Spawn helpers ──
-function spawnEnemy() {
+function spawnEnemy(forceType) {
   const p = state.player;
   const angle = Math.random() * Math.PI * 2;
   const dist = SPAWN_RING_MIN + Math.random() * (SPAWN_RING_MAX - SPAWN_RING_MIN);
   const ex = p.x + Math.cos(angle) * dist;
   const ey = p.y + Math.sin(angle) * dist;
-  if (ex < 0 || ex > WORLD_W || ey < 0 || ey > WORLD_H) return;
-  const typeName = pickEnemyType(state.timer);
+  if (ex < 0 || ex > WORLD_W || ey < 0 || ey > WORLD_H) return null;
+  const typeName = forceType || pickEnemyType(state.timer);
   const et = ENEMY_TYPES[typeName];
   const e = enemyPool.get();
   e.x = ex; e.y = ey;
@@ -258,6 +395,8 @@ function spawnEnemy() {
   e._speed = ENEMY_BASE_SPEED * state.enemySpeedMult * et.speedMult * (0.85 + Math.random() * 0.3);
   e._dmgMult = et.dmgMult;
   e._xpMult = et.xpMult;
+  if (typeName === 'exploder') e._explodeRadius = 60;
+  if (typeName === 'boss') { e._isBoss = true; e.scale.set(1); }
   // Redraw for this type
   e.clear();
   e.circle(0, 0, et.radius).fill(et.color);
@@ -265,16 +404,60 @@ function spawnEnemy() {
   e.circle(et.eyeOff, -et.eyeOff * 0.8, et.eyeR).fill(0xffffff);
   e.circle(-et.eyeOff, -et.eyeOff * 0.8, et.eyeR * 0.5).fill(0x111122);
   e.circle(et.eyeOff, -et.eyeOff * 0.8, et.eyeR * 0.5).fill(0x111122);
-  // Brute gets horns
   if (typeName === 'brute') {
     e.moveTo(-10, -12).lineTo(-14, -22).lineTo(-6, -14).fill(et.color);
     e.moveTo(10, -12).lineTo(14, -22).lineTo(6, -14).fill(et.color);
   }
-  // Dasher gets arrow marking
   if (typeName === 'dasher') {
     e.moveTo(0, -et.radius).lineTo(4, -et.radius + 5).lineTo(-4, -et.radius + 5).fill(0xffcc00);
   }
+  if (typeName === 'ranged') {
+    // Diamond marking
+    e.moveTo(0, -et.radius + 1).lineTo(4, -et.radius + 5).lineTo(0, -et.radius + 9).lineTo(-4, -et.radius + 5).fill(0xddaaff);
+  }
+  if (typeName === 'exploder') {
+    // Hazard stripes
+    e.circle(0, 0, et.radius * 0.6).fill(0xaaff44);
+    e.moveTo(-3, 0).lineTo(3, 0).stroke({ color: 0x111122, width: 2 });
+    e.moveTo(0, -3).lineTo(0, 3).stroke({ color: 0x111122, width: 2 });
+  }
+  if (typeName === 'boss') {
+    // Crown
+    e.moveTo(-20, -30).lineTo(-15, -42).lineTo(-5, -34).lineTo(0, -45).lineTo(5, -34).lineTo(15, -42).lineTo(20, -30).fill(0xffdd44);
+    // Skull marking
+    e.circle(0, 5, 10).fill(0x220000);
+    e.circle(-4, 3, 3).fill(0xff0000);
+    e.circle(4, 3, 3).fill(0xff0000);
+  }
   entityContainer.addChild(e);
+  return e;
+}
+
+function spawnBoss() {
+  if (state.bossSpawned) return;
+  state.bossSpawned = true;
+  const boss = spawnEnemy('boss');
+  if (boss) {
+    addShake(10, 0.5);
+    spawnParticles(boss.x, boss.y, 0xff2244, 20);
+    // Flash warning
+    showBossWarning();
+  }
+}
+
+function showBossWarning() {
+  const warn = new PIXI.Text({ text: '\u26A0 BOSS INCOMING \u26A0', style: { fontFamily: 'monospace', fontSize: 40, fill: 0xff2244, fontWeight: 'bold' } });
+  warn.anchor.set(0.5);
+  warn.x = app.screen.width / 2;
+  warn.y = app.screen.height / 2 - 50;
+  hudContainer.addChild(warn);
+  let t = 0;
+  const ticker = () => {
+    t += 0.05;
+    warn.alpha = 0.5 + Math.sin(t * 5) * 0.5;
+    if (t > 3) { if (warn.parent) warn.parent.removeChild(warn); warn.destroy(); app.ticker.remove(ticker); }
+  };
+  app.ticker.add(ticker);
 }
 
 function spawnXp(x, y, value) {
@@ -299,51 +482,690 @@ function spawnParticles(x, y, color, count) {
   }
 }
 
-function fireProjectile() {
+// ═══════════════════════════════════════════
+// ── WEAPON SYSTEM ──
+// ═══════════════════════════════════════════
+
+function getWeaponDamage(w) {
+  let dmg = WEAPON_DEFS[w.type].baseDamage;
+  const def = WEAPON_DEFS[w.type];
+  for (let i = 0; i <= w.level && i < def.levels.length; i++) {
+    if (def.levels[i].dmgMult) dmg *= def.levels[i].dmgMult;
+  }
+  return dmg * state.player.passives.damage;
+}
+
+function getWeaponCooldown(w) {
+  let cd = WEAPON_DEFS[w.type].baseCooldown;
+  const def = WEAPON_DEFS[w.type];
+  for (let i = 0; i <= w.level && i < def.levels.length; i++) {
+    if (def.levels[i].cdMult) cd *= def.levels[i].cdMult;
+  }
+  return cd * state.player.passives.cooldown;
+}
+
+function getWeaponProjCount(w) {
+  let count = 1;
+  const def = WEAPON_DEFS[w.type];
+  for (let i = 0; i <= w.level && i < def.levels.length; i++) {
+    if (def.levels[i].extraProj) count += def.levels[i].extraProj;
+  }
+  return count;
+}
+
+function getWeaponBounces(w) {
+  let bounces = 3;
+  const def = WEAPON_DEFS[w.type];
+  for (let i = 0; i <= w.level && i < def.levels.length; i++) {
+    if (def.levels[i].bounces) bounces = def.levels[i].bounces;
+  }
+  return bounces;
+}
+
+function getWeaponOrbCount(w) {
+  let count = 2;
+  const def = WEAPON_DEFS[w.type];
+  for (let i = 0; i <= w.level && i < def.levels.length; i++) {
+    if (def.levels[i].orbCount) count = def.levels[i].orbCount;
+  }
+  return count;
+}
+
+function getWeaponAreaMult(w) {
+  let mult = 1;
+  const def = WEAPON_DEFS[w.type];
+  for (let i = 0; i <= w.level && i < def.levels.length; i++) {
+    if (def.levels[i].areaMult) mult *= def.levels[i].areaMult;
+  }
+  return mult * state.player.passives.area * state.player.area;
+}
+
+function weaponHasPierce(w) {
+  const def = WEAPON_DEFS[w.type];
+  for (let i = 0; i <= w.level && i < def.levels.length; i++) {
+    if (def.levels[i].pierce) return true;
+  }
+  return false;
+}
+
+function weaponHasStun(w) {
+  const def = WEAPON_DEFS[w.type];
+  for (let i = 0; i <= w.level && i < def.levels.length; i++) {
+    if (def.levels[i].stun) return true;
+  }
+  return false;
+}
+
+function addWeapon(type) {
+  const w = { type, level: 0, cooldown: 0, _orbAngle: 0 };
+  state.player.weapons.push(w);
+  if (type === 'orbit') rebuildOrbs();
+}
+
+function upgradeWeapon(type) {
+  const w = state.player.weapons.find(w => w.type === type);
+  if (w && w.level < 4) {
+    w.level++;
+    if (type === 'orbit') rebuildOrbs();
+  }
+}
+
+// ── Orbit orbs management ──
+function rebuildOrbs() {
+  // Release all existing orbs
+  orbPool.releaseAll();
+  const w = state.player.weapons.find(w => w.type === 'orbit');
+  if (!w) return;
+  const count = getWeaponOrbCount(w);
+  const def = WEAPON_DEFS.orbit;
+  let radiusMult = 1;
+  for (let i = 0; i <= w.level && i < def.levels.length; i++) {
+    if (def.levels[i].radiusMult) radiusMult *= def.levels[i].radiusMult;
+  }
+  const baseRadius = 70 * radiusMult;
+  for (let i = 0; i < count; i++) {
+    const orb = orbPool.get();
+    orb._angle = (Math.PI * 2 / count) * i;
+    orb._radius = baseRadius;
+    orb._damage = getWeaponDamage(w);
+    orb.clear();
+    orb.circle(0, 0, 10).fill(0x44bbff);
+    orb.circle(0, 0, 6).fill(0x88ddff);
+    entityContainer.addChild(orb);
+  }
+}
+
+// ── Fire weapon: projectile ──
+function fireProjectile(w) {
   const p = state.player;
-  // Find nearest enemy
   let nearest = null, nearDist = Infinity;
   for (const e of enemyPool.active) {
     const dx = e.x - p.x, dy = e.y - p.y;
     const d = dx * dx + dy * dy;
     if (d < nearDist) { nearDist = d; nearest = e; }
   }
-  const count = p.projectileCount;
+  const count = getWeaponProjCount(w);
   const baseAngle = nearest
     ? Math.atan2(nearest.y - p.y, nearest.x - p.x)
     : Math.random() * Math.PI * 2;
   const spread = 0.2;
+  const speed = 400;
+  const pierce = weaponHasPierce(w);
   for (let i = 0; i < count; i++) {
     const angle = baseAngle + (i - (count - 1) / 2) * spread;
     const proj = projPool.get();
     proj.x = p.x; proj.y = p.y;
-    proj._vx = Math.cos(angle) * p.projectileSpeed;
-    proj._vy = Math.sin(angle) * p.projectileSpeed;
-    proj._life = 0;
-    proj._damage = p.damage;
-    proj._area = p.area;
-    proj.scale.set(p.area);
+    proj._vx = Math.cos(angle) * speed;
+    proj._vy = Math.sin(angle) * speed;
+    proj._damage = getWeaponDamage(w);
+    proj._area = getWeaponAreaMult(w);
+    proj._type = 'projectile';
+    proj._pierce = pierce;
+    proj.scale.set(proj._area);
+    proj.clear();
+    proj.circle(0, 0, 5).fill(0xffdd44);
     entityContainer.addChild(proj);
   }
 }
 
-// ── Screen Shake ──
-function addShake(intensity, duration) {
-  state.shakeIntensity = Math.max(state.shakeIntensity, intensity);
-  state.screenShake = Math.max(state.screenShake, duration);
+// ── Fire weapon: nova ──
+function fireNova(w) {
+  const p = state.player;
+  const radius = 100 * getWeaponAreaMult(w);
+  const damage = getWeaponDamage(w);
+  const stun = weaponHasStun(w);
+  // Visual burst
+  const burst = new PIXI.Graphics();
+  burst.circle(0, 0, radius).fill({ color: 0xff66aa, alpha: 0.3 });
+  burst.circle(0, 0, radius).stroke({ color: 0xff66aa, width: 3 });
+  burst.x = p.x; burst.y = p.y;
+  entityContainer.addChild(burst);
+  let burstLife = 0;
+  const burstTick = (ticker) => {
+    burstLife += ticker.deltaMS / 1000;
+    burst.alpha = 1 - burstLife / 0.3;
+    burst.scale.set(1 + burstLife * 0.5);
+    if (burstLife > 0.3) { if (burst.parent) burst.parent.removeChild(burst); burst.destroy(); app.ticker.remove(burstTick); }
+  };
+  app.ticker.add(burstTick);
+  // Damage enemies in radius
+  for (const e of enemyPool.active) {
+    const dx = e.x - p.x, dy = e.y - p.y;
+    if (dx * dx + dy * dy < radius * radius) {
+      damageEnemy(e, damage, 0xff66aa);
+      if (stun) e._stunTimer = Math.max(e._stunTimer, 1.0);
+    }
+  }
+  addShake(5, 0.15);
 }
 
-// ── HUD ──
-const hudBg = new PIXI.Graphics();
-hudContainer.addChild(hudBg);
+// ── Fire weapon: chain lightning ──
+function fireChain(w) {
+  const p = state.player;
+  const bounces = getWeaponBounces(w);
+  const damage = getWeaponDamage(w);
+  const stun = weaponHasStun(w);
+  // Find nearest enemy to start chain
+  let nearest = null, nearDist = Infinity;
+  for (const e of enemyPool.active) {
+    const dx = e.x - p.x, dy = e.y - p.y;
+    const d = dx * dx + dy * dy;
+    if (d < nearDist && d < 400 * 400) { nearDist = d; nearest = e; }
+  }
+  if (!nearest) return;
+  const hit = new Set();
+  let current = nearest;
+  let prevX = p.x, prevY = p.y;
+  for (let i = 0; i < bounces && current; i++) {
+    hit.add(current);
+    damageEnemy(current, damage * (1 - i * 0.1), 0x88ddff);
+    if (stun) current._stunTimer = Math.max(current._stunTimer, 0.5);
+    // Draw lightning line
+    drawLightning(prevX, prevY, current.x, current.y);
+    prevX = current.x; prevY = current.y;
+    // Find next closest not-hit enemy
+    let nextE = null, nextD = Infinity;
+    for (const e of enemyPool.active) {
+      if (hit.has(e)) continue;
+      const dx = e.x - current.x, dy = e.y - current.y;
+      const d = dx * dx + dy * dy;
+      if (d < 200 * 200 && d < nextD) { nextD = d; nextE = e; }
+    }
+    current = nextE;
+  }
+}
 
+function drawLightning(x1, y1, x2, y2) {
+  const g = new PIXI.Graphics();
+  g.moveTo(x1, y1);
+  const segs = 5;
+  for (let i = 1; i < segs; i++) {
+    const t = i / segs;
+    const mx = x1 + (x2 - x1) * t + (Math.random() - 0.5) * 20;
+    const my = y1 + (y2 - y1) * t + (Math.random() - 0.5) * 20;
+    g.lineTo(mx, my);
+  }
+  g.lineTo(x2, y2).stroke({ color: 0x88ddff, width: 3, alpha: 0.9 });
+  entityContainer.addChild(g);
+  let life = 0;
+  const tick = (ticker) => {
+    life += ticker.deltaMS / 1000;
+    g.alpha = 1 - life / 0.2;
+    if (life > 0.2) { if (g.parent) g.parent.removeChild(g); g.destroy(); app.ticker.remove(tick); }
+  };
+  app.ticker.add(tick);
+}
+
+// ── Fire weapon: boomerang ──
+function fireBoomerang(w) {
+  const p = state.player;
+  const count = getWeaponProjCount(w);
+  const damage = getWeaponDamage(w);
+  const speed = 350;
+  for (let i = 0; i < count; i++) {
+    const angle = (Math.PI * 2 / count) * i + Math.random() * 0.3;
+    const proj = projPool.get();
+    proj.x = p.x; proj.y = p.y;
+    proj._originX = p.x; proj._originY = p.y;
+    proj._vx = Math.cos(angle) * speed;
+    proj._vy = Math.sin(angle) * speed;
+    proj._damage = damage;
+    proj._area = getWeaponAreaMult(w);
+    proj._type = 'boomerang';
+    proj._boomerang = true;
+    proj._boomPhase = 0;
+    proj._boomAngle = angle;
+    proj._boomDist = 180;
+    proj._pierce = true;
+    proj.scale.set(proj._area * 1.2);
+    proj.clear();
+    // Blade shape
+    proj.moveTo(-8, 0).lineTo(0, -4).lineTo(8, 0).lineTo(0, 4).fill(0xff8844);
+    entityContainer.addChild(proj);
+  }
+}
+
+// ── Fire weapon: ground fire ──
+function fireGroundFire(w) {
+  const p = state.player;
+  const damage = getWeaponDamage(w);
+  let widthMult = 1, durationMult = 1;
+  const def = WEAPON_DEFS.groundfire;
+  for (let i = 0; i <= w.level && i < def.levels.length; i++) {
+    if (def.levels[i].widthMult) widthMult *= def.levels[i].widthMult;
+    if (def.levels[i].durationMult) durationMult *= def.levels[i].durationMult;
+  }
+  const radius = 16 * widthMult * state.player.passives.area;
+  const duration = 2.5 * durationMult;
+  const fire = firePool.get();
+  fire.x = p.x; fire.y = p.y;
+  fire._damage = damage;
+  fire._radius = radius;
+  fire._maxLife = duration;
+  fire.clear();
+  fire.circle(0, 0, radius).fill({ color: 0xff4400, alpha: 0.5 });
+  fire.circle(0, 0, radius * 0.6).fill({ color: 0xff8800, alpha: 0.4 });
+  entityContainer.addChild(fire);
+}
+
+// ── Damage enemy helper ──
+function damageEnemy(e, damage, color) {
+  e._hp -= damage;
+  spawnDamageNumber(e.x, e.y - e._radius, damage, color || 0xffdd44);
+  spawnParticles(e.x, e.y, ENEMY_TYPES[e._type]?.color || 0xff6644, 3);
+  if (e._hp <= 0) {
+    killEnemy(e);
+  }
+}
+
+function killEnemy(e) {
+  const xpVal = Math.ceil((1 + Math.floor(state.timer / 30)) * e._xpMult);
+  spawnXp(e.x, e.y, xpVal);
+  spawnParticles(e.x, e.y, ENEMY_TYPES[e._type]?.color || 0xff4444, 6);
+  // Exploder detonation
+  if (e._type === 'exploder') {
+    const radius = e._explodeRadius;
+    const p = state.player;
+    const dx = p.x - e.x, dy = p.y - e.y;
+    if (dx * dx + dy * dy < radius * radius) {
+      const dmg = Math.max(1, Math.round(ENEMY_DAMAGE * 2) - p.armor);
+      p.hp -= dmg;
+      p.damageCooldown = ENEMY_DAMAGE_COOLDOWN;
+      addShake(6, 0.2);
+      spawnParticles(p.x, p.y, 0xff4444, 6);
+      if (p.hp <= 0) { showGameOver(false); return; }
+    }
+    // Visual explosion
+    spawnParticles(e.x, e.y, 0x44ff44, 12);
+    // Also damage other enemies in radius
+    for (const other of enemyPool.active) {
+      if (other === e) continue;
+      const odx = other.x - e.x, ody = other.y - e.y;
+      if (odx * odx + ody * ody < radius * radius) {
+        other._hp -= 20;
+        if (other._hp <= 0) killEnemy(other);
+      }
+    }
+    addShake(5, 0.2);
+  }
+  if (e._isBoss) {
+    state.bossDefeated = true;
+    addShake(12, 0.5);
+    spawnParticles(e.x, e.y, 0xffdd44, 30);
+    // Drop lots of XP
+    for (let i = 0; i < 15; i++) {
+      spawnXp(e.x + (Math.random() - 0.5) * 60, e.y + (Math.random() - 0.5) * 60, 5);
+    }
+  } else {
+    addShake(e._type === 'brute' ? 4 : 2, e._type === 'brute' ? 0.14 : 0.08);
+  }
+  state.player.kills++;
+  enemyPool.release(e);
+}
+
+// ── Update weapons ──
+function updateWeapons(dt) {
+  const p = state.player;
+  for (const w of p.weapons) {
+    if (w.type === 'orbit') {
+      // Orbs are updated separately
+      continue;
+    }
+    w.cooldown -= dt;
+    if (w.cooldown <= 0 && enemyPool.active.length > 0) {
+      const cd = getWeaponCooldown(w);
+      w.cooldown = cd;
+      if (w.type === 'projectile') fireProjectile(w);
+      else if (w.type === 'nova') fireNova(w);
+      else if (w.type === 'chain') fireChain(w);
+      else if (w.type === 'boomerang') fireBoomerang(w);
+      else if (w.type === 'groundfire') fireGroundFire(w);
+    }
+  }
+}
+
+function updateOrbs(dt) {
+  const p = state.player;
+  const w = p.weapons.find(w => w.type === 'orbit');
+  if (!w) return;
+  w._orbAngle = (w._orbAngle || 0) + dt * 2.5;
+  const damage = getWeaponDamage(w);
+  const count = orbPool.active.length;
+  for (let i = 0; i < orbPool.active.length; i++) {
+    const orb = orbPool.active[i];
+    const baseAngle = (Math.PI * 2 / count) * i + w._orbAngle;
+    orb.x = p.x + Math.cos(baseAngle) * orb._radius;
+    orb.y = p.y + Math.sin(baseAngle) * orb._radius;
+    orb._damage = damage;
+    orb._dmgCd -= dt;
+    // Check collision with enemies
+    if (orb._dmgCd <= 0) {
+      for (const e of enemyPool.active) {
+        const dx = orb.x - e.x, dy = orb.y - e.y;
+        if (dx * dx + dy * dy < (12 + e._radius) * (12 + e._radius)) {
+          damageEnemy(e, damage, 0x44bbff);
+          orb._dmgCd = 0.3;
+          break;
+        }
+      }
+    }
+  }
+}
+
+// ═══════════════════════════════════════════
+// ── PASSIVE UPGRADES ──
+// ═══════════════════════════════════════════
+const PASSIVE_UPGRADES = [
+  { id: 'p_damage', name: 'ATK Up', desc: '+20% Damage', icon: '\u2694', color: 0xff6644, apply: ps => { ps.damage *= 1.2; } },
+  { id: 'p_speed', name: 'Speed Up', desc: '+12% Move Speed', icon: '\u26A1', color: 0x44bbff, apply: ps => { ps.speed *= 1.12; } },
+  { id: 'p_area', name: 'Area Up', desc: '+15% Area', icon: '\u{1F4A5}', color: 0x66ff66, apply: ps => { ps.area *= 1.15; } },
+  { id: 'p_cooldown', name: 'Haste', desc: '-10% Cooldowns', icon: '\u{23F1}\uFE0F', color: 0xff8800, apply: ps => { ps.cooldown *= 0.9; } },
+  { id: 'p_hp', name: 'Max HP', desc: '+25 Max HP & Heal', icon: '\u2764', color: 0xff4466, apply: (ps, p) => { ps.maxHp += 25; p.maxHp += 25; p.hp = Math.min(p.hp + 25, p.maxHp); } },
+  { id: 'p_armor', name: 'Armor', desc: '-3 Damage Taken', icon: '\u{1F6E1}\uFE0F', color: 0x8888cc, apply: ps => { ps.armor += 3; } },
+  { id: 'p_magnet', name: 'Magnet', desc: '+35% Pickup Range', icon: '\u{1F9F2}', color: 0xaa44ff, apply: ps => { ps.magnetRange *= 1.35; } },
+  { id: 'p_regen', name: 'Regen', desc: '+0.5 HP/sec', icon: '\u{1F33F}', color: 0x44ff88, apply: ps => { ps.regen += 0.5; } },
+];
+
+// ═══════════════════════════════════════════
+// ── LEVEL UP SYSTEM ──
+// ═══════════════════════════════════════════
+
+function generateLevelUpChoices() {
+  const choices = [];
+  const p = state.player;
+  // Offer weapon upgrades for existing weapons that aren't max level
+  const upgradeable = p.weapons.filter(w => w.level < 4);
+  // Offer new weapons if we have room
+  const ownedTypes = new Set(p.weapons.map(w => w.type));
+  const newWeapons = Object.keys(WEAPON_DEFS).filter(t => !ownedTypes.has(t));
+
+  // Build pool: weapon upgrades, new weapons, passives
+  const pool = [];
+  for (const w of upgradeable) {
+    const def = WEAPON_DEFS[w.type];
+    const nextLevel = def.levels[w.level + 1];
+    pool.push({
+      id: `weapon_${w.type}`,
+      name: `${def.name} Lv${w.level + 2}`,
+      desc: nextLevel.desc,
+      icon: def.icon,
+      color: def.color,
+      isWeaponUpgrade: true,
+      weaponType: w.type,
+    });
+  }
+  if (p.weapons.length < MAX_WEAPONS) {
+    for (const t of newWeapons) {
+      const def = WEAPON_DEFS[t];
+      pool.push({
+        id: `weapon_new_${t}`,
+        name: def.name,
+        desc: def.desc,
+        icon: def.icon,
+        color: def.color,
+        isNewWeapon: true,
+        weaponType: t,
+      });
+    }
+  }
+  for (const pu of PASSIVE_UPGRADES) {
+    pool.push({ ...pu, isPassive: true });
+  }
+
+  // Shuffle and pick 3
+  const shuffled = pool.sort(() => Math.random() - 0.5);
+  return shuffled.slice(0, 3);
+}
+
+let levelUpChoices = [];
+let levelUpCards = [];
+
+function showLevelUp() {
+  state.phase = 'levelup';
+  levelUpChoices = generateLevelUpChoices();
+  uiContainer.removeChildren();
+
+  const overlay = new PIXI.Graphics();
+  overlay.rect(0, 0, app.screen.width, app.screen.height).fill({ color: 0x000000, alpha: 0.6 });
+  uiContainer.addChild(overlay);
+
+  const title = new PIXI.Text({ text: `LEVEL UP! (Lv ${state.player.level})`, style: { fontFamily: 'monospace', fontSize: 32, fill: 0xffdd44, fontWeight: 'bold' } });
+  title.anchor.set(0.5, 0);
+  title.x = app.screen.width / 2;
+  title.y = app.screen.height * 0.12;
+  uiContainer.addChild(title);
+
+  const cardW = 180, cardH = 240, gap = 20;
+  const totalW = levelUpChoices.length * cardW + (levelUpChoices.length - 1) * gap;
+  const startX = (app.screen.width - totalW) / 2;
+  const cardY = app.screen.height * 0.25;
+
+  levelUpCards = [];
+  levelUpChoices.forEach((choice, i) => {
+    const card = new PIXI.Container();
+    card.x = startX + i * (cardW + gap);
+    card.y = cardY;
+    card.eventMode = 'static';
+    card.cursor = 'pointer';
+
+    const bg = new PIXI.Graphics();
+    bg.roundRect(0, 0, cardW, cardH, 12).fill(0x1a1a33);
+    bg.roundRect(0, 0, cardW, cardH, 12).stroke({ color: choice.color, width: 2 });
+    card.addChild(bg);
+
+    // Category label
+    let catLabel = 'PASSIVE';
+    let catColor = 0x888888;
+    if (choice.isNewWeapon) { catLabel = 'NEW WEAPON'; catColor = 0xffdd44; }
+    else if (choice.isWeaponUpgrade) { catLabel = 'UPGRADE'; catColor = 0x44ff88; }
+    const catText = new PIXI.Text({ text: catLabel, style: { fontFamily: 'monospace', fontSize: 10, fill: catColor, fontWeight: 'bold' } });
+    catText.anchor.set(0.5);
+    catText.x = cardW / 2; catText.y = 18;
+    card.addChild(catText);
+
+    const iconText = new PIXI.Text({ text: choice.icon, style: { fontSize: 40 } });
+    iconText.anchor.set(0.5);
+    iconText.x = cardW / 2; iconText.y = 58;
+    card.addChild(iconText);
+
+    const nameText = new PIXI.Text({ text: choice.name, style: { fontFamily: 'monospace', fontSize: 18, fill: choice.color, fontWeight: 'bold' } });
+    nameText.anchor.set(0.5);
+    nameText.x = cardW / 2; nameText.y = 105;
+    card.addChild(nameText);
+
+    const descText = new PIXI.Text({ text: choice.desc, style: { fontFamily: 'monospace', fontSize: 13, fill: 0xcccccc, wordWrap: true, wordWrapWidth: cardW - 20 } });
+    descText.anchor.set(0.5);
+    descText.x = cardW / 2; descText.y = 150;
+    card.addChild(descText);
+
+    const keyLabel = new PIXI.Text({ text: `[${i + 1}]`, style: { fontFamily: 'monospace', fontSize: 18, fill: 0x888888 } });
+    keyLabel.anchor.set(0.5);
+    keyLabel.x = cardW / 2; keyLabel.y = cardH - 30;
+    card.addChild(keyLabel);
+
+    card.on('pointerdown', () => selectUpgrade(i));
+    uiContainer.addChild(card);
+    levelUpCards.push(card);
+  });
+}
+
+function selectUpgrade(index) {
+  const choice = levelUpChoices[index];
+  if (!choice) return;
+  if (choice.isNewWeapon) {
+    addWeapon(choice.weaponType);
+  } else if (choice.isWeaponUpgrade) {
+    upgradeWeapon(choice.weaponType);
+  } else if (choice.isPassive) {
+    choice.apply(state.player.passives, state.player);
+  }
+  state.upgradeHistory.push(choice.id);
+  uiContainer.removeChildren();
+  state.phase = 'playing';
+}
+
+// ── Game Over UI ──
+function showGameOver(won) {
+  state.phase = 'gameover';
+  uiContainer.removeChildren();
+
+  const overlay = new PIXI.Graphics();
+  overlay.rect(0, 0, app.screen.width, app.screen.height).fill({ color: 0x000000, alpha: 0.7 });
+  uiContainer.addChild(overlay);
+
+  const titleStr = won ? 'YOU SURVIVED!' : 'GAME OVER';
+  const titleColor = won ? 0x44ff88 : 0xff4444;
+  const title = new PIXI.Text({ text: titleStr, style: { fontFamily: 'monospace', fontSize: 48, fill: titleColor, fontWeight: 'bold' } });
+  title.anchor.set(0.5);
+  title.x = app.screen.width / 2;
+  title.y = app.screen.height * 0.25;
+  uiContainer.addChild(title);
+
+  const elapsed = Math.min(state.timer, GAME_DURATION);
+  const mins = Math.floor(elapsed / 60);
+  const secs = Math.floor(elapsed % 60);
+  const weaponList = state.player.weapons.map(w => `${WEAPON_DEFS[w.type].name} Lv${w.level + 1}`).join(', ');
+  const stats = [
+    `Time: ${mins}:${secs.toString().padStart(2, '0')} / 10:00`,
+    `Level: ${state.player.level}`,
+    `Kills: ${state.player.kills}`,
+    `Weapons: ${weaponList || 'None'}`,
+    `Boss: ${state.bossDefeated ? 'Defeated!' : state.bossSpawned ? 'Not defeated' : 'Not reached'}`,
+    `Score: ${state.player.kills * 10 + state.player.level * 50 + (won ? 2000 : 0) + (state.bossDefeated ? 1000 : 0)}`,
+  ].join('\n');
+
+  const statsText = new PIXI.Text({ text: stats, style: { fontFamily: 'monospace', fontSize: 20, fill: 0xcccccc, align: 'center', lineHeight: 30 } });
+  statsText.anchor.set(0.5);
+  statsText.x = app.screen.width / 2;
+  statsText.y = app.screen.height * 0.5;
+  uiContainer.addChild(statsText);
+
+  const restart = new PIXI.Text({ text: 'Press SPACE or Click to Restart', style: { fontFamily: 'monospace', fontSize: 20, fill: 0xffdd44 } });
+  restart.anchor.set(0.5);
+  restart.x = app.screen.width / 2;
+  restart.y = app.screen.height * 0.75;
+  uiContainer.addChild(restart);
+}
+
+// ── Title Screen ──
+function showTitle() {
+  state.phase = 'title';
+  uiContainer.removeChildren();
+
+  const overlay = new PIXI.Graphics();
+  overlay.rect(0, 0, app.screen.width, app.screen.height).fill({ color: 0x000000, alpha: 0.8 });
+  uiContainer.addChild(overlay);
+
+  const title = new PIXI.Text({ text: 'SURVIVOR ARENA', style: { fontFamily: 'monospace', fontSize: 52, fill: 0x44bbff, fontWeight: 'bold' } });
+  title.anchor.set(0.5);
+  title.x = app.screen.width / 2;
+  title.y = app.screen.height * 0.25;
+  uiContainer.addChild(title);
+
+  const sub = new PIXI.Text({ text: 'Survive 10 minutes. Collect weapons. Defeat the boss.', style: { fontFamily: 'monospace', fontSize: 17, fill: 0x888899 } });
+  sub.anchor.set(0.5);
+  sub.x = app.screen.width / 2;
+  sub.y = app.screen.height * 0.38;
+  uiContainer.addChild(sub);
+
+  const features = new PIXI.Text({ text: '6 Weapon Types \u2022 Passive Upgrades \u2022 5 Enemy Types \u2022 Boss Fight', style: { fontFamily: 'monospace', fontSize: 14, fill: 0x667788 } });
+  features.anchor.set(0.5);
+  features.x = app.screen.width / 2;
+  features.y = app.screen.height * 0.45;
+  uiContainer.addChild(features);
+
+  const controls = new PIXI.Text({ text: 'WASD / Arrow Keys to move\nWeapons fire automatically\n\nPress SPACE or Click to Start', style: { fontFamily: 'monospace', fontSize: 16, fill: 0x667788, align: 'center', lineHeight: 26 } });
+  controls.anchor.set(0.5);
+  controls.x = app.screen.width / 2;
+  controls.y = app.screen.height * 0.6;
+  uiContainer.addChild(controls);
+}
+
+// ── Reset Game ──
+function resetGame() {
+  enemyPool.releaseAll();
+  projPool.releaseAll();
+  xpPool.releaseAll();
+  particlePool.releaseAll();
+  firePool.releaseAll();
+  orbPool.releaseAll();
+  Object.assign(state.player, {
+    x: WORLD_W / 2, y: WORLD_H / 2,
+    hp: PLAYER_MAX_HP, maxHp: PLAYER_MAX_HP,
+    xp: 0, level: 1, xpToNext: xpForLevel(1),
+    damageCooldown: 0,
+    speed: PLAYER_SPEED,
+    magnetRange: XP_MAGNET_RANGE,
+    area: 1.0, armor: 0, kills: 0, _regen: 0,
+    weapons: [],
+    passives: {
+      damage: 1, speed: 1, area: 1, cooldown: 1, maxHp: 0, armor: 0, magnetRange: 1, regen: 0,
+    },
+  });
+  // Start with projectile weapon
+  addWeapon('projectile');
+  state.timer = 0;
+  state.spawnTimer = 0;
+  state.spawnRate = 1.5;
+  state.enemyHpMult = 1;
+  state.enemySpeedMult = 1;
+  state.waveNumber = 0;
+  state.upgradeHistory = [];
+  state.screenShake = 0;
+  state.shakeIntensity = 0;
+  state.bossSpawned = false;
+  state.bossDefeated = false;
+  playerGfx.x = state.player.x;
+  playerGfx.y = state.player.y;
+  uiContainer.removeChildren();
+  state.phase = 'playing';
+}
+
+// ── Input handlers for UI ──
+window.addEventListener('keydown', e => {
+  if (state.phase === 'title' && e.code === 'Space') { resetGame(); return; }
+  if (state.phase === 'gameover' && e.code === 'Space') { resetGame(); return; }
+  if (state.phase === 'levelup') {
+    if (e.code === 'Digit1' || e.code === 'Numpad1') selectUpgrade(0);
+    if (e.code === 'Digit2' || e.code === 'Numpad2') selectUpgrade(1);
+    if (e.code === 'Digit3' || e.code === 'Numpad3') selectUpgrade(2);
+  }
+});
+app.canvas.addEventListener('pointerdown', () => {
+  if (state.phase === 'title') resetGame();
+  if (state.phase === 'gameover') resetGame();
+});
+
+// ═══════════════════════════════════════════
+// ── HUD ──
+// ═══════════════════════════════════════════
 const hpBarBg = new PIXI.Graphics();
 const hpBarFg = new PIXI.Graphics();
 const xpBarBg = new PIXI.Graphics();
 const xpBarFg = new PIXI.Graphics();
 hudContainer.addChild(hpBarBg, hpBarFg, xpBarBg, xpBarFg);
 
-const timerText = new PIXI.Text({ text: '3:00', style: { fontFamily: 'monospace', fontSize: 24, fill: 0xffffff, fontWeight: 'bold' } });
+const timerText = new PIXI.Text({ text: '10:00', style: { fontFamily: 'monospace', fontSize: 24, fill: 0xffffff, fontWeight: 'bold' } });
 timerText.anchor.set(0.5, 0);
 hudContainer.addChild(timerText);
 
@@ -355,6 +1177,16 @@ hudContainer.addChild(killText);
 
 const enemyCountText = new PIXI.Text({ text: '', style: { fontFamily: 'monospace', fontSize: 14, fill: 0x999999 } });
 hudContainer.addChild(enemyCountText);
+
+const weaponSlotsText = new PIXI.Text({ text: '', style: { fontFamily: 'monospace', fontSize: 13, fill: 0xaaaacc } });
+hudContainer.addChild(weaponSlotsText);
+
+// Boss HP bar
+const bossHpBg = new PIXI.Graphics();
+const bossHpFg = new PIXI.Graphics();
+const bossLabel = new PIXI.Text({ text: '', style: { fontFamily: 'monospace', fontSize: 16, fill: 0xff2244, fontWeight: 'bold' } });
+bossLabel.anchor.set(0.5, 0);
+hudContainer.addChild(bossHpBg, bossHpFg, bossLabel);
 
 function updateHUD() {
   const sw = app.screen.width, p = state.player;
@@ -388,240 +1220,80 @@ function updateHUD() {
   enemyCountText.text = `Enemies: ${enemyPool.active.length}`;
   enemyCountText.x = margin;
   enemyCountText.y = xpY + 52;
-}
 
-// ── Upgrade System ──
-const ALL_UPGRADES = [
-  { id: 'damage', name: 'ATK Up', desc: '+25% Damage', icon: '\u2694', color: 0xff6644, apply: p => { p.damage *= 1.25; } },
-  { id: 'speed', name: 'Speed Up', desc: '+15% Move Speed', icon: '\u26A1', color: 0x44bbff, apply: p => { p.speed *= 1.15; } },
-  { id: 'fire_rate', name: 'Fire Rate', desc: '+20% Attack Speed', icon: '\u{1F525}', color: 0xff8800, apply: p => { p.fireRate *= 0.8; } },
-  { id: 'hp', name: 'Max HP', desc: '+25 Max HP & Heal', icon: '\u2764', color: 0xff4466, apply: p => { p.maxHp += 25; p.hp = Math.min(p.hp + 25, p.maxHp); } },
-  { id: 'magnet', name: 'Magnet', desc: '+40% Pickup Range', icon: '\u{1F9F2}', color: 0xaa44ff, apply: p => { p.magnetRange *= 1.4; } },
-  { id: 'multishot', name: 'Multi Shot', desc: '+1 Projectile', icon: '\u{1F4A0}', color: 0xffdd44, apply: p => { p.projectileCount += 1; } },
-  { id: 'area', name: 'Area Up', desc: '+20% Projectile Size', icon: '\u{1F4A5}', color: 0x66ff66, apply: p => { p.area *= 1.2; } },
-  { id: 'armor', name: 'Armor', desc: '-3 Damage Taken', icon: '\u{1F6E1}', color: 0x8888cc, apply: p => { p.armor += 3; } },
-  { id: 'proj_speed', name: 'Velocity', desc: '+20% Proj Speed', icon: '\u27A4', color: 0x44ddff, apply: p => { p.projectileSpeed *= 1.2; } },
-  { id: 'regen', name: 'Regen', desc: '+0.5 HP/sec', icon: '\u{1F33F}', color: 0x44ff88, apply: p => { p._regen = (p._regen || 0) + 0.5; } },
-];
+  // Weapon slots display
+  const weaponStr = p.weapons.map(w => {
+    const def = WEAPON_DEFS[w.type];
+    return `${def.icon} ${def.name} Lv${w.level + 1}`;
+  }).join('  ');
+  weaponSlotsText.text = weaponStr;
+  weaponSlotsText.x = margin;
+  weaponSlotsText.y = xpY + 70;
 
-function getRandomUpgrades(count) {
-  const shuffled = [...ALL_UPGRADES].sort(() => Math.random() - 0.5);
-  return shuffled.slice(0, count);
-}
-
-// ── Level Up UI ──
-let levelUpChoices = [];
-let levelUpCards = [];
-
-function showLevelUp() {
-  state.phase = 'levelup';
-  levelUpChoices = getRandomUpgrades(3);
-  uiContainer.removeChildren();
-
-  // Overlay
-  const overlay = new PIXI.Graphics();
-  overlay.rect(0, 0, app.screen.width, app.screen.height).fill({ color: 0x000000, alpha: 0.6 });
-  uiContainer.addChild(overlay);
-
-  const title = new PIXI.Text({ text: `LEVEL UP! (Lv ${state.player.level})`, style: { fontFamily: 'monospace', fontSize: 32, fill: 0xffdd44, fontWeight: 'bold' } });
-  title.anchor.set(0.5, 0);
-  title.x = app.screen.width / 2;
-  title.y = app.screen.height * 0.15;
-  uiContainer.addChild(title);
-
-  const cardW = 180, cardH = 220, gap = 20;
-  const totalW = levelUpChoices.length * cardW + (levelUpChoices.length - 1) * gap;
-  const startX = (app.screen.width - totalW) / 2;
-  const cardY = app.screen.height * 0.3;
-
-  levelUpCards = [];
-  levelUpChoices.forEach((upgrade, i) => {
-    const card = new PIXI.Container();
-    card.x = startX + i * (cardW + gap);
-    card.y = cardY;
-    card.eventMode = 'static';
-    card.cursor = 'pointer';
-
-    const bg = new PIXI.Graphics();
-    bg.roundRect(0, 0, cardW, cardH, 12).fill(0x1a1a33);
-    bg.roundRect(0, 0, cardW, cardH, 12).stroke({ color: upgrade.color, width: 2 });
-    card.addChild(bg);
-
-    const iconText = new PIXI.Text({ text: upgrade.icon, style: { fontSize: 40 } });
-    iconText.anchor.set(0.5);
-    iconText.x = cardW / 2; iconText.y = 50;
-    card.addChild(iconText);
-
-    const nameText = new PIXI.Text({ text: upgrade.name, style: { fontFamily: 'monospace', fontSize: 20, fill: upgrade.color, fontWeight: 'bold' } });
-    nameText.anchor.set(0.5);
-    nameText.x = cardW / 2; nameText.y = 100;
-    card.addChild(nameText);
-
-    const descText = new PIXI.Text({ text: upgrade.desc, style: { fontFamily: 'monospace', fontSize: 14, fill: 0xcccccc, wordWrap: true, wordWrapWidth: cardW - 20 } });
-    descText.anchor.set(0.5);
-    descText.x = cardW / 2; descText.y = 140;
-    card.addChild(descText);
-
-    const keyLabel = new PIXI.Text({ text: `[${i + 1}]`, style: { fontFamily: 'monospace', fontSize: 18, fill: 0x888888 } });
-    keyLabel.anchor.set(0.5);
-    keyLabel.x = cardW / 2; keyLabel.y = cardH - 30;
-    card.addChild(keyLabel);
-
-    card.on('pointerdown', () => selectUpgrade(i));
-    uiContainer.addChild(card);
-    levelUpCards.push(card);
-  });
-}
-
-function selectUpgrade(index) {
-  const upgrade = levelUpChoices[index];
-  if (!upgrade) return;
-  upgrade.apply(state.player);
-  state.upgrades.push(upgrade.id);
-  uiContainer.removeChildren();
-  state.phase = 'playing';
-}
-
-// ── Game Over UI ──
-function showGameOver(won) {
-  state.phase = 'gameover';
-  uiContainer.removeChildren();
-
-  const overlay = new PIXI.Graphics();
-  overlay.rect(0, 0, app.screen.width, app.screen.height).fill({ color: 0x000000, alpha: 0.7 });
-  uiContainer.addChild(overlay);
-
-  const titleStr = won ? 'YOU SURVIVED!' : 'GAME OVER';
-  const titleColor = won ? 0x44ff88 : 0xff4444;
-  const title = new PIXI.Text({ text: titleStr, style: { fontFamily: 'monospace', fontSize: 48, fill: titleColor, fontWeight: 'bold' } });
-  title.anchor.set(0.5);
-  title.x = app.screen.width / 2;
-  title.y = app.screen.height * 0.3;
-  uiContainer.addChild(title);
-
-  const elapsed = Math.min(state.timer, GAME_DURATION);
-  const mins = Math.floor(elapsed / 60);
-  const secs = Math.floor(elapsed % 60);
-  const stats = [
-    `Time: ${mins}:${secs.toString().padStart(2, '0')}`,
-    `Level: ${state.player.level}`,
-    `Kills: ${state.player.kills}`,
-    `Score: ${state.player.kills * 10 + state.player.level * 50 + (won ? 1000 : 0)}`,
-  ].join('\n');
-
-  const statsText = new PIXI.Text({ text: stats, style: { fontFamily: 'monospace', fontSize: 22, fill: 0xcccccc, align: 'center', lineHeight: 32 } });
-  statsText.anchor.set(0.5);
-  statsText.x = app.screen.width / 2;
-  statsText.y = app.screen.height * 0.5;
-  uiContainer.addChild(statsText);
-
-  const restart = new PIXI.Text({ text: 'Press SPACE or Click to Restart', style: { fontFamily: 'monospace', fontSize: 20, fill: 0xffdd44 } });
-  restart.anchor.set(0.5);
-  restart.x = app.screen.width / 2;
-  restart.y = app.screen.height * 0.7;
-  uiContainer.addChild(restart);
-}
-
-// ── Title Screen ──
-function showTitle() {
-  state.phase = 'title';
-  uiContainer.removeChildren();
-
-  const overlay = new PIXI.Graphics();
-  overlay.rect(0, 0, app.screen.width, app.screen.height).fill({ color: 0x000000, alpha: 0.8 });
-  uiContainer.addChild(overlay);
-
-  const title = new PIXI.Text({ text: 'SURVIVOR ARENA', style: { fontFamily: 'monospace', fontSize: 52, fill: 0x44bbff, fontWeight: 'bold' } });
-  title.anchor.set(0.5);
-  title.x = app.screen.width / 2;
-  title.y = app.screen.height * 0.3;
-  uiContainer.addChild(title);
-
-  const sub = new PIXI.Text({ text: 'Survive 3 minutes. Auto-attack. Level up.', style: { fontFamily: 'monospace', fontSize: 18, fill: 0x888899 } });
-  sub.anchor.set(0.5);
-  sub.x = app.screen.width / 2;
-  sub.y = app.screen.height * 0.42;
-  uiContainer.addChild(sub);
-
-  const controls = new PIXI.Text({ text: 'WASD / Arrow Keys to move\nWeapons fire automatically\n\nPress SPACE or Click to Start', style: { fontFamily: 'monospace', fontSize: 16, fill: 0x667788, align: 'center', lineHeight: 26 } });
-  controls.anchor.set(0.5);
-  controls.x = app.screen.width / 2;
-  controls.y = app.screen.height * 0.6;
-  uiContainer.addChild(controls);
-}
-
-// ── Reset Game ──
-function resetGame() {
-  enemyPool.releaseAll();
-  projPool.releaseAll();
-  xpPool.releaseAll();
-  particlePool.releaseAll();
-  Object.assign(state.player, {
-    x: WORLD_W / 2, y: WORLD_H / 2,
-    hp: PLAYER_MAX_HP, maxHp: PLAYER_MAX_HP,
-    xp: 0, level: 1, xpToNext: xpForLevel(1),
-    weaponCooldown: 0, damageCooldown: 0,
-    speed: PLAYER_SPEED, damage: PROJECTILE_DAMAGE,
-    fireRate: WEAPON_COOLDOWN, projectileCount: 1,
-    projectileSpeed: PROJECTILE_SPEED,
-    magnetRange: XP_MAGNET_RANGE,
-    area: 1.0, armor: 0, kills: 0, _regen: 0,
-  });
-  state.timer = 0;
-  state.spawnTimer = 0;
-  state.spawnRate = 1.5;
-  state.enemyHpMult = 1;
-  state.enemySpeedMult = 1;
-  state.waveNumber = 0;
-  state.upgrades = [];
-  state.screenShake = 0;
-  state.shakeIntensity = 0;
-  playerGfx.x = state.player.x;
-  playerGfx.y = state.player.y;
-  uiContainer.removeChildren();
-  state.phase = 'playing';
-}
-
-// ── Input handlers for UI ──
-window.addEventListener('keydown', e => {
-  if (state.phase === 'title' && e.code === 'Space') { resetGame(); return; }
-  if (state.phase === 'gameover' && e.code === 'Space') { resetGame(); return; }
-  if (state.phase === 'levelup') {
-    if (e.code === 'Digit1' || e.code === 'Numpad1') selectUpgrade(0);
-    if (e.code === 'Digit2' || e.code === 'Numpad2') selectUpgrade(1);
-    if (e.code === 'Digit3' || e.code === 'Numpad3') selectUpgrade(2);
+  // Boss HP bar
+  const boss = enemyPool.active.find(e => e._isBoss);
+  if (boss) {
+    const bossBarW = Math.min(400, sw - 80);
+    const bossY = app.screen.height - 50;
+    bossHpBg.clear().roundRect((sw - bossBarW) / 2, bossY, bossBarW, 18, 4).fill(0x331111);
+    const bossRatio = Math.max(0, boss._hp / boss._maxHp);
+    bossHpFg.clear().roundRect((sw - bossBarW) / 2, bossY, bossBarW * bossRatio, 18, 4).fill(0xff2244);
+    bossLabel.text = `ARENA CHAMPION - ${Math.ceil(boss._hp)} HP`;
+    bossLabel.x = sw / 2;
+    bossLabel.y = bossY - 22;
+    bossLabel.visible = true;
+    bossHpBg.visible = true;
+    bossHpFg.visible = true;
+  } else {
+    bossLabel.visible = false;
+    bossHpBg.visible = false;
+    bossHpFg.visible = false;
   }
-});
-app.canvas.addEventListener('pointerdown', () => {
-  if (state.phase === 'title') resetGame();
-  if (state.phase === 'gameover') resetGame();
-});
+}
 
-// ── Difficulty scaling ──
+// ═══════════════════════════════════════════
+// ── DIFFICULTY SCALING ──
+// ═══════════════════════════════════════════
 function updateDifficulty(dt) {
   state.timer += dt;
   const t = state.timer;
-  // Spawn faster over time
-  state.spawnRate = Math.max(0.15, 1.5 - t * 0.007);
-  // Enemies get tougher
-  state.enemyHpMult = 1 + t * 0.015;
-  state.enemySpeedMult = 1 + t * 0.003;
+
+  // Spawn rate: starts slow, ramps up, peaks mid-game, slight ease before boss
+  if (t < 120) {
+    state.spawnRate = Math.max(0.3, 1.5 - t * 0.01);
+  } else if (t < 300) {
+    state.spawnRate = Math.max(0.15, 0.3 - (t - 120) * 0.0008);
+  } else {
+    state.spawnRate = Math.max(0.1, 0.15 - (t - 300) * 0.0002);
+  }
+
+  // Enemy HP curve: gradual ramp
+  state.enemyHpMult = 1 + t * 0.008 + Math.pow(t / 300, 2) * 2;
+  // Enemy speed: subtle increase
+  state.enemySpeedMult = 1 + t * 0.002;
+
   // Spawn timer
   state.spawnTimer -= dt;
   if (state.spawnTimer <= 0) {
-    const count = 1 + Math.floor(t / 30);
-    for (let i = 0; i < count && enemyPool.active.length < 200; i++) spawnEnemy();
+    let count = 1 + Math.floor(t / 25);
+    if (t > 300) count += 2; // Post-boss surge
+    for (let i = 0; i < count && enemyPool.active.length < 250; i++) spawnEnemy();
     state.spawnTimer = state.spawnRate;
+  }
+
+  // Boss spawn at 5 minutes
+  if (t >= BOSS_TIME && !state.bossSpawned) {
+    spawnBoss();
   }
 }
 
-// ── Main Game Loop ──
+// ═══════════════════════════════════════════
+// ── MAIN GAME LOOP ──
+// ═══════════════════════════════════════════
 app.ticker.add((ticker) => {
-  const dt = ticker.deltaMS / 1000;
+  const dt = Math.min(ticker.deltaMS / 1000, 0.05); // Cap dt
 
-  if (state.phase === 'title') return;
-  if (state.phase === 'gameover') return;
-  if (state.phase === 'levelup') return;
+  if (state.phase !== 'playing') return;
 
   const p = state.player;
 
@@ -632,8 +1304,9 @@ app.ticker.add((ticker) => {
   if (keys['KeyA'] || keys['ArrowLeft']) mx = -1;
   if (keys['KeyD'] || keys['ArrowRight']) mx = 1;
   if (mx !== 0 && my !== 0) { mx *= 0.7071; my *= 0.7071; }
-  p.x += mx * p.speed * dt;
-  p.y += my * p.speed * dt;
+  const effectiveSpeed = p.speed * p.passives.speed;
+  p.x += mx * effectiveSpeed * dt;
+  p.y += my * effectiveSpeed * dt;
   p.x = Math.max(PLAYER_RADIUS, Math.min(WORLD_W - PLAYER_RADIUS, p.x));
   p.y = Math.max(PLAYER_RADIUS, Math.min(WORLD_H - PLAYER_RADIUS, p.y));
   playerGfx.x = p.x;
@@ -647,10 +1320,15 @@ app.ticker.add((ticker) => {
     playerGfx.alpha = 1;
   }
 
-  // Regen
-  if (p._regen && p._regen > 0) {
-    p.hp = Math.min(p.maxHp, p.hp + p._regen * dt);
+  // Regen (passive)
+  const totalRegen = p.passives.regen;
+  if (totalRegen > 0) {
+    p.hp = Math.min(p.maxHp, p.hp + totalRegen * dt);
   }
+
+  // Effective armor
+  p.armor = p.passives.armor;
+  p.magnetRange = XP_MAGNET_RANGE * p.passives.magnetRange;
 
   // ── Difficulty & Spawning ──
   updateDifficulty(dt);
@@ -661,46 +1339,110 @@ app.ticker.add((ticker) => {
     return;
   }
 
-  // ── Auto-attack ──
-  p.weaponCooldown -= dt;
-  if (p.weaponCooldown <= 0 && enemyPool.active.length > 0) {
-    fireProjectile();
-    p.weaponCooldown = p.fireRate;
-  }
+  // ── Update Weapons ──
+  updateWeapons(dt);
+  updateOrbs(dt);
 
   // ── Update projectiles ──
   for (let i = projPool.active.length - 1; i >= 0; i--) {
     const proj = projPool.active[i];
     proj._life += dt;
-    if (proj._life > PROJECTILE_LIFETIME || proj.x < -50 || proj.x > WORLD_W + 50 || proj.y < -50 || proj.y > WORLD_H + 50) {
-      projPool.release(proj);
-      continue;
-    }
-    proj.x += proj._vx * dt;
-    proj.y += proj._vy * dt;
 
-    // Check collision with enemies
-    const projR = 5 * proj._area;
+    // Boomerang movement
+    if (proj._boomerang) {
+      proj._boomPhase += dt;
+      const totalTime = 1.2;
+      if (proj._boomPhase > totalTime) {
+        projPool.release(proj);
+        continue;
+      }
+      // Outward then curve back
+      const t = proj._boomPhase / totalTime;
+      const speed = 350;
+      if (t < 0.4) {
+        // Fly outward
+        proj.x += proj._vx * dt;
+        proj.y += proj._vy * dt;
+      } else {
+        // Return to player
+        const dx = state.player.x - proj.x;
+        const dy = state.player.y - proj.y;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist > 10) {
+          proj.x += (dx / dist) * speed * 1.5 * dt;
+          proj.y += (dy / dist) * speed * 1.5 * dt;
+        } else {
+          projPool.release(proj);
+          continue;
+        }
+      }
+      // Spin visual
+      proj.rotation += dt * 12;
+    } else if (proj._enemyProj) {
+      // Enemy projectile: straight line
+      proj.x += proj._vx * dt;
+      proj.y += proj._vy * dt;
+      if (proj._life > 3) { projPool.release(proj); continue; }
+      // Check hit player
+      const dx = proj.x - p.x, dy = proj.y - p.y;
+      if (dx * dx + dy * dy < (PLAYER_RADIUS + 5) * (PLAYER_RADIUS + 5)) {
+        const dmg = Math.max(1, Math.round(proj._damage) - p.armor);
+        p.hp -= dmg;
+        p.damageCooldown = ENEMY_DAMAGE_COOLDOWN;
+        addShake(4, 0.12);
+        spawnParticles(p.x, p.y, 0xff4444, 4);
+        projPool.release(proj);
+        if (p.hp <= 0) { showGameOver(false); return; }
+        continue;
+      }
+      continue; // Skip enemy collision checks for enemy projectiles
+    } else {
+      if (proj._life > 1.2 || proj.x < -50 || proj.x > WORLD_W + 50 || proj.y < -50 || proj.y > WORLD_H + 50) {
+        projPool.release(proj);
+        continue;
+      }
+      proj.x += proj._vx * dt;
+      proj.y += proj._vy * dt;
+    }
+
+    // Check collision with enemies (player projectiles)
+    const projR = 5 * (proj._area || 1);
     for (let j = enemyPool.active.length - 1; j >= 0; j--) {
       const e = enemyPool.active[j];
+      if (proj._pierce && proj._pierceHit && proj._pierceHit.has(e)) continue;
       const dx = proj.x - e.x, dy = proj.y - e.y;
       const dist = dx * dx + dy * dy;
       const hitR = projR + e._radius;
       if (dist < hitR * hitR) {
-        e._hp -= proj._damage;
-        spawnDamageNumber(e.x, e.y - e._radius, proj._damage, 0xffdd44);
-        e.tint = 0xffffff; setTimeout(() => { if (e.visible) e.tint = 0xffffff; }, 0);
-        spawnParticles(e.x, e.y, ENEMY_TYPES[e._type]?.color || 0xff6644, 3);
-        projPool.release(proj);
-        if (e._hp <= 0) {
-          const xpVal = Math.ceil((1 + Math.floor(state.timer / 30)) * e._xpMult);
-          spawnXp(e.x, e.y, xpVal);
-          spawnParticles(e.x, e.y, ENEMY_TYPES[e._type]?.color || 0xff4444, 6);
-          enemyPool.release(e);
-          p.kills++;
-          addShake(e._type === 'brute' ? 4 : 2, e._type === 'brute' ? 0.14 : 0.08);
+        damageEnemy(e, proj._damage, WEAPON_DEFS[proj._type]?.color || 0xffdd44);
+        if (proj._pierce) {
+          if (proj._pierceHit) proj._pierceHit.add(e);
+        } else {
+          projPool.release(proj);
+          break;
         }
-        break;
+      }
+    }
+  }
+
+  // ── Update fire zones ──
+  for (let i = firePool.active.length - 1; i >= 0; i--) {
+    const fire = firePool.active[i];
+    fire._life += dt;
+    fire._dmgCd -= dt;
+    fire.alpha = 0.5 * (1 - fire._life / fire._maxLife);
+    if (fire._life >= fire._maxLife) {
+      firePool.release(fire);
+      continue;
+    }
+    // Damage enemies standing in fire
+    if (fire._dmgCd <= 0) {
+      fire._dmgCd = 0.3;
+      for (const e of enemyPool.active) {
+        const dx = e.x - fire.x, dy = e.y - fire.y;
+        if (dx * dx + dy * dy < (fire._radius + e._radius) * (fire._radius + e._radius)) {
+          damageEnemy(e, fire._damage, 0xff4400);
+        }
       }
     }
   }
@@ -708,11 +1450,64 @@ app.ticker.add((ticker) => {
   // ── Update enemies ──
   for (let i = enemyPool.active.length - 1; i >= 0; i--) {
     const e = enemyPool.active[i];
+    if (!e.visible) continue;
     const dx = p.x - e.x, dy = p.y - e.y;
     const dist = Math.sqrt(dx * dx + dy * dy);
 
-    // Dasher behavior: charge at player periodically
-    if (e._type === 'dasher') {
+    // Stunned
+    if (e._stunTimer > 0) {
+      e._stunTimer -= dt;
+      e.alpha = 0.5 + Math.sin(state.timer * 20) * 0.3;
+      e._damageCd -= dt;
+      continue;
+    }
+    e.alpha = 1;
+
+    // Boss behavior
+    if (e._isBoss) {
+      e._bossChargeCd -= dt;
+      // Phase based on HP
+      const hpRatio = e._hp / e._maxHp;
+      if (hpRatio < 0.3) e._bossPhase = 2;
+      else if (hpRatio < 0.6) e._bossPhase = 1;
+
+      // Move toward player (slow)
+      if (dist > 50) {
+        const spd = e._speed * (1 + e._bossPhase * 0.3);
+        e.x += (dx / dist) * spd * dt;
+        e.y += (dy / dist) * spd * dt;
+      }
+
+      // Boss charge attack
+      if (e._bossChargeCd <= 0) {
+        e._bossChargeCd = 4 - e._bossPhase;
+        // Spawn ring of projectiles
+        const projCount = 8 + e._bossPhase * 4;
+        for (let j = 0; j < projCount; j++) {
+          const angle = (Math.PI * 2 / projCount) * j;
+          const bp = projPool.get();
+          bp.x = e.x; bp.y = e.y;
+          bp._vx = Math.cos(angle) * 150;
+          bp._vy = Math.sin(angle) * 150;
+          bp._damage = ENEMY_DAMAGE * 1.5;
+          bp._enemyProj = true;
+          bp.clear();
+          bp.circle(0, 0, 6).fill(0xff2244);
+          entityContainer.addChild(bp);
+        }
+        addShake(4, 0.1);
+        spawnParticles(e.x, e.y, 0xff2244, 8);
+      }
+      // Spawn minions periodically in later phases
+      if (e._bossPhase >= 1 && Math.random() < 0.005) {
+        spawnEnemy('swarmer');
+      }
+      if (e._bossPhase >= 2 && Math.random() < 0.003) {
+        spawnEnemy('exploder');
+      }
+    }
+    // Dasher behavior
+    else if (e._type === 'dasher') {
       e._dashCd -= dt;
       if (e._dashing) {
         e._dashTimer -= dt;
@@ -731,26 +1526,77 @@ app.ticker.add((ticker) => {
         e.x += (dx / dist) * e._speed * dt;
         e.y += (dy / dist) * e._speed * dt;
       }
-    } else if (dist > 1) {
+    }
+    // Ranged behavior: keep distance, shoot
+    else if (e._type === 'ranged') {
+      e._shootCd -= dt;
+      const preferredDist = 200;
+      if (dist < preferredDist - 30) {
+        // Retreat
+        e.x -= (dx / dist) * e._speed * 1.2 * dt;
+        e.y -= (dy / dist) * e._speed * 1.2 * dt;
+      } else if (dist > preferredDist + 50) {
+        // Approach
+        e.x += (dx / dist) * e._speed * dt;
+        e.y += (dy / dist) * e._speed * dt;
+      }
+      // Shoot at player
+      if (e._shootCd <= 0 && dist < 350) {
+        e._shootCd = 2.0 + Math.random();
+        const bp = projPool.get();
+        bp.x = e.x; bp.y = e.y;
+        const spd = 180;
+        bp._vx = (dx / dist) * spd;
+        bp._vy = (dy / dist) * spd;
+        bp._damage = ENEMY_DAMAGE * e._dmgMult;
+        bp._enemyProj = true;
+        bp.clear();
+        bp.circle(0, 0, 5).fill(0xaa44ff);
+        entityContainer.addChild(bp);
+      }
+    }
+    // Exploder: rushes toward player, explodes on contact or death
+    else if (e._type === 'exploder') {
+      if (dist > 1) {
+        e.x += (dx / dist) * e._speed * dt;
+        e.y += (dy / dist) * e._speed * dt;
+      }
+      // Flash when close
+      if (dist < 40) {
+        e.alpha = 0.5 + Math.sin(state.timer * 15) * 0.5;
+      }
+    }
+    // Default: walk toward player
+    else if (dist > 1) {
       e.x += (dx / dist) * e._speed * dt;
       e.y += (dy / dist) * e._speed * dt;
     }
+
     e._damageCd -= dt;
 
-    // Enemy-player collision (use per-enemy radius)
+    // Enemy-player collision
     const hitDist = PLAYER_RADIUS + e._radius;
     if (dist < hitDist && e._damageCd <= 0) {
+      // Exploder: self-destruct on contact
+      if (e._type === 'exploder') {
+        killEnemy(e);
+        continue;
+      }
       const dmg = Math.max(1, Math.round(ENEMY_DAMAGE * e._dmgMult) - p.armor);
       p.hp -= dmg;
       p.damageCooldown = ENEMY_DAMAGE_COOLDOWN;
       e._damageCd = ENEMY_DAMAGE_COOLDOWN;
-      addShake(e._type === 'brute' ? 6 : 4, e._type === 'brute' ? 0.18 : 0.12);
-      spawnParticles(p.x, p.y, 0xff4444, e._type === 'brute' ? 6 : 4);
+      addShake(e._isBoss ? 8 : e._type === 'brute' ? 6 : 4, e._isBoss ? 0.25 : e._type === 'brute' ? 0.18 : 0.12);
+      spawnParticles(p.x, p.y, 0xff4444, e._isBoss ? 8 : e._type === 'brute' ? 6 : 4);
       if (p.hp <= 0) {
         showGameOver(false);
         return;
       }
     }
+
+    // Keep enemies in bounds
+    e.x = Math.max(e._radius, Math.min(WORLD_W - e._radius, e.x));
+    e.y = Math.max(e._radius, Math.min(WORLD_H - e._radius, e.y));
   }
 
   // ── Update XP gems ──
@@ -761,7 +1607,6 @@ app.ticker.add((ticker) => {
     if (dist < XP_COLLECT_RANGE) {
       p.xp += gem._value;
       xpPool.release(gem);
-      // Level up check
       while (p.xp >= p.xpToNext) {
         p.xp -= p.xpToNext;
         p.level++;
